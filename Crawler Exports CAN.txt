@@ -1,0 +1,401 @@
+
+val process_date:String = String.valueOf(z.textbox("process_date"))
+val lDate = java.time.LocalDate.parse(process_date)
+----------------------------------------------------------------
+//make necessary imports and set up some variables
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import org.apache.spark.sql._
+import java.time._
+import java.sql.Date
+import java.util.UUID
+
+//historical data classes and functions
+val hhSchema = 
+StructType(
+	StructField("numDetailRecords",IntegerType,false) :: 
+	StructField("calcDate",StringType,true) :: 
+	StructField("minDate",StringType,true) :: 
+	StructField("maxDate",StringType,true) :: 
+	StructField("historyRecords",ArrayType(MapType(StringType,StringType)),true) :: Nil
+)
+
+val getMinimalHistoryString = udf((hhRow:Row) => {
+  val hRecs:Seq[Map[String,String]] = hhRow.getAs[Seq[Map[String,String]]]("historyRecords")
+  var sbAll:StringBuilder = null
+  var thisPrice:String = "this"
+  var lastPrice:String = "last"
+  var histItem:String = ""
+  if(hRecs != null && hRecs.length > 0){ 
+    for(hd <- hRecs){
+      if(hd("changeCode").equals("M")==false){
+          thisPrice = hd("price").toString
+          histItem = hd("date") + "," + hd("price") + "," + hd("mileage")
+          if(thisPrice.equals(lastPrice) == false){
+              if(sbAll == null) sbAll = new StringBuilder()
+              else sbAll.append(":")
+              sbAll.append(histItem)
+          }
+          lastPrice = thisPrice
+      }
+    }
+  }
+  
+  sbAll.toString
+})
+
+--------------------------------------------------------------------------------------------------
+import java.sql.Date
+import java.time.YearMonth
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+
+//calculate dates
+val currFiledate = Date.valueOf(lDate)
+val currFileMonth = YearMonth.from(lDate).toString
+val filenamedate = DateTimeFormatter.BASIC_ISO_DATE.format(lDate)
+
+val bb_crawler_history_table_can ="bb_crawler_history_can"
+var bb_crawler_snapshot_table_can ="bb_crawler_snapshots_can"
+
+val soldLDate = lDate.minusDays(4)
+val soldFiledate = Date.valueOf(soldLDate)
+val soldFileMonth = YearMonth.from(soldLDate).toString
+
+
+var exports_table_can = "retail_exports_can"
+
+
+sc.setCheckpointDir("s3://blackbook-retail-listings/checkpoint/")
+
+----------------------------------------------------------------------------------------------
+import org.apache.hadoop.fs.FileSystem
+import org.apache.hadoop.fs.FileSystem
+import org.apache.hadoop.fs.Path
+import java.net.URI
+
+val bbActiveHistCAN = spark.read.table(bb_crawler_history_table_can)
+                           .where($"process_date"===currFiledate && $"last_process_date"===currFiledate && $"postal_code"=!="Z9Z9Z9")
+                           .withColumn("price_mileage_history",getMinimalHistoryString(from_json($"price_mileage_history", hhSchema)))
+                           .withColumn("list-key", concat_ws("-", $"vin", $"postal_code", $"seller_id",$"stock_type"))
+                           .select("list_key","bb_listing_id","price_mileage_history","number_price_changes","first_process_date","last_process_date")
+                           .withColumn("sale_type",lit(""))
+
+val bbActiveSnapCAN = spark.read.table(bb_crawler_snapshot_table_can)
+                           .where($"process_date"===currFiledate && $"seller_zip"=!="Z9Z9Z9")
+                          .withColumn("match_type",expr("case when match_type in ('EVM','VIN','MULT','MDF') then match_type else 'DESCR' end"))
+                           .withColumn("has_leather",expr("case when bb_ad_names like '%leather%' and bb_ad_names not like '%w/o leather%' and bb_ad_names not like '%leatherette%' then '1' else '0' end"))
+                           .withColumn("has_navigation",expr("case when bb_ad_names like '%nav%' and bb_ad_names not like '%w/o nav%' then '1' else '0' end"))
+                           .withColumn("list-key", concat_ws("-",$"vin",$"seller_zip",$"seller_id"))
+                           .withColumnRenamed("seller_zip","postalcode")
+                           .withColumn("seller_phone",split($"seller_phones",",").getItem(0))
+                           
+
+val bbActiveListingsCAN = bbActiveHistCAN.join(bbActiveSnapCAN, "list_key")
+                                .withColumn("dropoff_date",lit("ACTIVE"))
+                                .withColumn("listing_type", lit("ACTIVE"))
+                                .select($"seller_city".as("city"),
+                                      $"dealer_domain",
+                                      $"seller_id",
+                                      $"seller_name".as("dealer_name"),
+                                      $"dropoff_date",
+                                      lit("").as("ext_msrp"),
+                                      $"exterior_color",
+                                      $"exterior_color_categories",
+                                      $"first_process_date".as("first_seen_date"),
+                                      $"flags",
+                                      $"has_leather",
+                                      $"has_navigation",
+                                      $"vehicle_title".as("heading"),
+                                      $"interior_color",
+                                      $"interior_color_categories",
+                                      $"cpo_flag".as("is_certified"),
+                                      $"last_process_date".as("last_seen_date"),
+                                      $"seller_latitude".as("latitude"),
+                                      $"bb_listing_id".as("listing_id"),
+                                      $"seller_longitude".as("longitude"),
+                                      $"match_type",
+                                      $"listing_mileage".as("mileage"),
+                                      $"number_price_changes",
+                                      $"optional_features",
+                                      $"listing_price".as("price"),
+                                      $"price_mileage_history",
+                                      $"sale_type",
+                                      $"dealer_notes".as("seller_comments"),
+                                      lit("").as("seller_email"),
+                                      $"seller_phone",
+                                      $"source",
+                                      $"standard_features",
+                                      $"seller_state".as("province"),
+                                      $"stock_type",
+                                      $"seller_address".as("street"),
+                                      $"bb_vehicle_id".as("vehicle_id"),
+                                      $"vin",
+                                      $"postalcode",
+                                      $"listing_vdp_url".as("listing_url"),
+                                      lit("").as("photo_links"),
+                                      coalesce($"bb_location_score",lit(0).cast(IntegerType)).as("location_score"),        
+                                      $"seller_address",
+                                      $"record_id",
+                                      $"bb_reporting_segment_code",
+                                      $"bb_model_year",
+                                      $"bb_make_name",
+                                      $"bb_model_name",
+                                      $"bb_series_name",
+                                      $"bb_bodystyle_name",
+                                      $"bb_mileage_cat",
+                                      $"bb_mileadj_retail_xclean",
+                                      $"bb_mileadj_retail_clean",
+                                      $"bb_mileadj_retail_average",
+                                      $"bb_mileadj_retail_rough",
+                                      $"bb_groupnum",
+                                      $"bb_daily_xcl".as("bb_base_wholesale_xclean"),
+                                      $"bb_daily_cln".as("bb_base_wholesale_clean"),
+                                      $"bb_daily_avg".as("bb_base_wholesale_average"),
+                                      $"bb_daily_rgh".as("bb_base_wholesale_rough"),
+                                      $"bb_ads_value",
+                                      $"bb_ads_json",
+                                      $"bb_adjusted_retail_xclean",
+                                      $"bb_adjusted_retail_clean",
+                                      $"bb_adjusted_retail_average",
+                                      $"bb_adjusted_retail_rough",
+                                      $"stock_number",
+                                      $"process_date",
+                                      $"listing_type") 
+									 
+--------------------------------------------------------------------------------------------------------------------------------
+val bbSoldHistCAN = spark.read.table(bb_crawler_history_table_can)
+                           .where($"process_date"===currFiledate && $"last_process_date"===soldFiledate && $"postal_code"=!="Z9Z9Z9")
+                           .withColumn("price_mileage_history",getMinimalHistoryString(from_json($"price_mileage_history", hhSchema)))
+                           .withColumn("list-key", concat_ws("-",$"vin",$"postal_code",$"seller_id"))
+                           .select("list_key","bb_listing_id","price_mileage_history","number_price_changes","first_process_date","last_process_date")
+                           .withColumn("sale_type",lit(""))
+                           .withColumn("dropoff_date",date_format(date_add($"last_process_date",1),"yyyy-MM-dd"))
+
+val bbSoldSnapCAN = spark.read.table(bb_crawler_snapshot_table_can)
+                           .where($"process_date"===soldFiledate && $"seller_zip"=!="Z9Z9Z9")
+                          .withColumn("match_type",expr("case when match_type in ('EVM','VIN','MULT','MDF') then match_type else 'DESCR' end"))
+                           .withColumn("has_leather",expr("case when bb_ad_names like '%leather%' and bb_ad_names not like '%w/o leather%' and bb_ad_names not like '%leatherette%' then '1' else '0' end"))
+                           .withColumn("has_navigation",expr("case when bb_ad_names like '%nav%' and bb_ad_names not like '%w/o nav%' then '1' else '0' end"))
+                           .withColumn("list-key", concat_ws("-",$"vin",$"seller_zip",$"seller_id"))
+                           .withColumnRenamed("seller_zip","postalcode")
+                           .withColumn("seller_phone",split($"seller_phones",",").getItem(0))
+
+
+val bbSoldListingsCAN = bbSoldHistCAN.join(bbSoldSnapCAN, "list_key")
+                                .withColumn("process_date", lit(currFiledate))
+                                .withColumn("listing_type", lit("SOLD"))
+                                .select($"seller_city".as("city"),
+                                      $"dealer_domain",
+                                      $"seller_id",
+                                      $"seller_name".as("dealer_name"),
+                                      $"dropoff_date",
+                                      lit("").as("ext_msrp"),
+                                      $"exterior_color",
+                                      $"exterior_color_categories",
+                                      $"first_process_date".as("first_seen_date"),
+                                      $"flags",
+                                      $"has_leather",
+                                      $"has_navigation",
+                                      $"vehicle_title".as("heading"),
+                                      $"interior_color",
+                                      $"interior_color_categories",
+                                      $"cpo_flag".as("is_certified"),
+                                      $"last_process_date".as("last_seen_date"),
+                                      $"seller_latitude".as("latitude"),
+                                      $"bb_listing_id".as("listing_id"),
+                                      $"seller_longitude".as("longitude"),
+                                      $"match_type",
+                                      $"listing_mileage".as("mileage"),
+                                      $"number_price_changes",
+                                      $"optional_features",
+                                      $"listing_price".as("price"),
+                                      $"price_mileage_history",
+                                      $"sale_type",
+                                      $"dealer_notes".as("seller_comments"),
+                                      lit("").as("seller_email"),
+                                      $"seller_phone",
+                                      $"source",
+                                      $"standard_features",
+                                      $"seller_state".as("province"),
+                                      $"stock_type",
+                                      $"seller_address".as("street"),
+                                      $"bb_vehicle_id".as("vehicle_id"),
+                                      $"vin",
+                                      $"postalcode",
+                                      $"listing_vdp_url".as("listing_url"),
+                                      lit("").as("photo_links"),
+                                      coalesce($"bb_location_score",lit(0).cast(IntegerType)).as("location_score"),
+                                      $"seller_address",
+                                      $"record_id",
+                                      $"bb_reporting_segment_code",
+                                      $"bb_model_year",
+                                      $"bb_make_name",
+                                      $"bb_model_name",
+                                      $"bb_series_name",
+                                      $"bb_bodystyle_name",
+                                      $"bb_mileage_cat",
+                                      $"bb_mileadj_retail_xclean",
+                                      $"bb_mileadj_retail_clean",
+                                      $"bb_mileadj_retail_average",
+                                      $"bb_mileadj_retail_rough",
+                                      $"bb_groupnum",
+                                      $"bb_daily_xcl".as("bb_base_wholesale_xclean"),
+                                      $"bb_daily_cln".as("bb_base_wholesale_clean"),
+                                      $"bb_daily_avg".as("bb_base_wholesale_average"),
+                                      $"bb_daily_rgh".as("bb_base_wholesale_rough"),
+                                      $"bb_ads_value",
+                                      $"bb_ads_json",
+                                      $"bb_adjusted_retail_xclean",
+                                      $"bb_adjusted_retail_clean",
+                                      $"bb_adjusted_retail_average",
+                                      $"bb_adjusted_retail_rough",
+                                      $"stock_number",
+                                      $"process_date",
+                                      $"listing_type") 
+------------------------------------------------------------------------------------------------------------------------------
+import java.util.UUID
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+
+// Create a unique, timestamped backup path
+
+// Define paths
+val dealerIdLookupPath = "s3://blackbook-retail-listings/bb-crawler/resources/dealer-id-lookup"
+val tempDealerIdLookupPath = "s3://blackbook-retail-listings/bb-crawler/temp/dealer-id-lookup"
+val backupBasePath = "s3://blackbook-retail-listings/bb-crawler/dealer_id_backup"
+
+
+val processDateStr = lDate.format(DateTimeFormatter.ofPattern("yyyyMMdd")) 
+
+
+val dealerIdLookupBackupPath = s"$backupBasePath/$processDateStr/dealer-id-lookup"
+val tempDealerIdLookupBackupPath = s"$backupBasePath/$processDateStr/temp-dealer-id-lookup"
+
+// Timestamp for paths
+val timestampFormat = DateTimeFormatter.ofPattern("yyyyMMdd")
+val timestamp = java.time.LocalDateTime.now().format(timestampFormat)
+val uniqueId = UUID.randomUUID().toString
+
+// Create paths with timestamps and UUID
+val dealerIdLookupBackupPathWithUUID = s"$dealerIdLookupBackupPath-$timestamp-$uniqueId"
+val tempDealerIdLookupBackupPathWithUUID = s"$tempDealerIdLookupBackupPath-$timestamp-$uniqueId"
+
+// Backup dealer-id-lookup and temp 
+spark.read.parquet(dealerIdLookupPath).write.mode("overwrite").parquet(dealerIdLookupBackupPathWithUUID)
+spark.read.parquet(tempDealerIdLookupPath).write.mode("overwrite").parquet(tempDealerIdLookupBackupPathWithUUID)
+
+-------------------------------------------------------------------------------------------------------------------
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.DataFrame
+
+val can_sellers = bbActiveListingsCAN.select("source","seller_id")
+                                     .union(bbSoldListingsCAN.select("source","seller_id"))
+                                     .distinct
+
+//read existing mappings
+val dlr_id_lookup = spark.read.parquet("s3://blackbook-retail-listings/bb-crawler/resources/dealer-id-lookup")
+                              .groupBy("seller_id").agg(max("dealer_id").as("dealer_id"),max("source").as("source"))
+                              .select("seller_id","dealer_id","source")
+
+//get maximum dealer_id currently in the dealer-id-lookup data
+val max_dealer_id = dlr_id_lookup.agg(max("dealer_id")).head().getInt(0)
+
+//find existing and missing matches 
+val dlr_id_can = can_sellers.join(dlr_id_lookup, Seq("source","seller_id"), "left_outer")
+
+val has_dlr_id = dlr_id_can.where("dealer_id is not null")
+val need_dlr_id = dlr_id_can.where("dealer_id is null").select("source","seller_id").distinct
+
+//calculate the new dealer ids
+val windowSpec = Window.orderBy("source","seller_id")
+val new_dealer_ids = need_dlr_id.withColumn("dealer_id", row_number().over(windowSpec) + lit(max_dealer_id))
+                                .select("seller_id","dealer_id","source")
+
+//combine the existing and new dealer ids
+val sid_did_map =  has_dlr_id.select("seller_id","dealer_id","source")
+                             .union(new_dealer_ids.select("seller_id","dealer_id","source"))
+                             .cache
+
+//record the new dealer-id-lookup dataset
+dlr_id_lookup.write.mode("overwrite").parquet("s3://blackbook-retail-listings/bb-crawler/temp/dealer-id-lookup")
+new_dealer_ids.write.mode("append").parquet("s3://blackbook-retail-listings/bb-crawler/temp/dealer-id-lookup")
+
+val new_did_lookup = spark.read.parquet("s3://blackbook-retail-listings/bb-crawler/temp/dealer-id-lookup").distinct
+new_did_lookup.coalesce(1).write.mode("overwrite").parquet("s3://blackbook-retail-listings/bb-crawler/resources/dealer-id-lookup")
+---------------------------------------------------------------------------------------------------------------------------------------
+val finalActiveListingsCAN = bbActiveListingsCAN.join(sid_did_map, Seq("source","seller_id"), "left_outer")
+                                            .withColumn("dealer_id",coalesce($"dealer_id",lit(0)))
+
+val finalSoldListingsCAN = bbSoldListingsCAN.join(sid_did_map, Seq("source","seller_id"), "left_outer")
+                                            .withColumn("dealer_id",coalesce($"dealer_id",lit(0)))
+------------------------------------------------------------------------------------------------------------------------------------------
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.DataFrame
+import org.apache.commons.lang3.math.NumberUtils
+
+
+// UDF to check if a string is a valid number using NumberUtils
+val isNumericAndNotNull = udf((data: String) => Option(data).exists(NumberUtils.isCreatable))
+
+// Function to apply QA checks 
+def applyQAChecks(df: DataFrame): DataFrame = {
+  df.withColumn("qa_reject_reason",
+    when(col("location_score").isNull, "Missing location_score")
+     .when(col("postalcode").isNull || trim(col("postalcode")) === "", "Missing or empty postalcode")
+     .when(to_date(col("first_seen_date"), "yyyy-MM-dd").isNull, "Invalid first_seen_date")
+     .when(to_date(col("last_seen_date"), "yyyy-MM-dd").isNull, "Invalid last_seen_date")
+     .when(col("dropoff_date") =!= "ACTIVE" && to_date(col("dropoff_date"), "yyyy-MM-dd").isNull, "Invalid dropoff_date")
+     .when(datediff(current_date(), to_date(col("first_seen_date"), "yyyy-MM-dd")) > 365, "first_seen_date is older than 1 year")
+     .when(!isNumericAndNotNull(col("latitude").cast("string")), "Invalid latitude")
+     .when(!isNumericAndNotNull(col("longitude").cast("string")), "Invalid longitude")
+     .when(!isNumericAndNotNull(col("number_price_changes").cast("string")), "Invalid number_price_changes")
+     .when(!isNumericAndNotNull(col("dealer_id").cast("string")), "Invalid dealer_id")
+     .when(!isNumericAndNotNull(col("vehicle_id").cast("string")), "Invalid vehicle_id")
+     .when(!isNumericAndNotNull(col("price").cast("string")), "Invalid price")
+     .when(col("listing_id").isNull, "Missing listing_id")
+     .when(col("price_mileage_history").isNull, "Missing price_mileage_history")
+     .when(col("dealer_name").isNull || trim(col("dealer_name")) === "", "Missing or empty dealer_name")
+     .when(col("vin").isNull || col("vin") === "", "Missing or empty VIN")
+     .when(col("listing_url").isNull || col("listing_url") === "", "Missing or empty listing_url")
+     .otherwise(null)
+  )
+}
+
+------------------------------------------------------------------------------------------------------------------------------
+val QaActiveListingsCAN = applyQAChecks(finalActiveListingsCAN)
+val QaSoldListingsCAN = applyQAChecks(finalSoldListingsCAN)
+---------------------------------------------------------------------------------------------------------------------------
+
+spark.sql("set hive.exec.dynamic.partition=true")
+spark.sql("set hive.exec.dynamic.partition.mode=nonstrict")
+
+QaActiveListingsCAN.select("city","dealer_domain","dealer_id","dealer_name","dropoff_date","ext_msrp","exterior_color","exterior_color_categories","first_seen_date","flags","has_leather","has_navigation","heading","interior_color","interior_color_categories","is_certified","last_seen_date","latitude","listing_id","longitude","match_type","mileage","number_price_changes","optional_features","price","price_mileage_history","sale_type","seller_comments","seller_email","seller_phone","source","standard_features","province","stock_type","street","vehicle_id","vin","postalcode","listing_url","photo_links","location_score","seller_address","record_id","bb_reporting_segment_code","bb_model_year","bb_make_name","bb_model_name","bb_series_name","bb_bodystyle_name","bb_mileage_cat","bb_mileadj_retail_xclean","bb_mileadj_retail_clean","bb_mileadj_retail_average","bb_mileadj_retail_rough","bb_groupnum","bb_base_wholesale_xclean","bb_base_wholesale_clean","bb_base_wholesale_average","bb_base_wholesale_rough","bb_ads_value","bb_ads_json","bb_adjusted_retail_xclean","bb_adjusted_retail_clean","bb_adjusted_retail_average","bb_adjusted_retail_rough","stock_number","qa_reject_reason","process_date","listing_type")
+.repartition(10)
+.write.mode("overwrite")
+.insertInto(exports_table_can)
+
+QaSoldListingsCAN.select("city","dealer_domain","dealer_id","dealer_name","dropoff_date","ext_msrp","exterior_color","exterior_color_categories","first_seen_date","flags","has_leather","has_navigation","heading","interior_color","interior_color_categories","is_certified","last_seen_date","latitude","listing_id","longitude","match_type","mileage","number_price_changes","optional_features","price","price_mileage_history","sale_type","seller_comments","seller_email","seller_phone","source","standard_features","province","stock_type","street","vehicle_id","vin","postalcode","listing_url","photo_links","location_score","seller_address","record_id","bb_reporting_segment_code","bb_model_year","bb_make_name","bb_model_name","bb_series_name","bb_bodystyle_name","bb_mileage_cat","bb_mileadj_retail_xclean","bb_mileadj_retail_clean","bb_mileadj_retail_average","bb_mileadj_retail_rough","bb_groupnum","bb_base_wholesale_xclean","bb_base_wholesale_clean","bb_base_wholesale_average","bb_base_wholesale_rough","bb_ads_value","bb_ads_json","bb_adjusted_retail_xclean","bb_adjusted_retail_clean","bb_adjusted_retail_average","bb_adjusted_retail_rough","stock_number","qa_reject_reason","process_date","listing_type")
+.repartition(10)
+.write.mode("overwrite")
+.insertInto(exports_table_can)
+
+spark.sql("alter table "+exports_table_can+" recover partitions")
+----------------------------------------------------------------------------------------------------------------------------------
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import org.apache.hadoop.fs.FileSystem
+import org.apache.hadoop.fs.Path
+import java.net.URI
+
+
+val processnamedate = DateTimeFormatter.BASIC_ISO_DATE.format(lDate)
+
+val rawDataDir = "s3://blackbook-retail-listings/bb-crawler/output/" + processnamedate + "/"
+val rawDataFS = FileSystem.get(new URI(rawDataDir), sc.hadoopConfiguration)
+val bosRaw = new java.io.BufferedOutputStream(rawDataFS.create(new Path(rawDataDir + "bbCAN_exports_flag")))
+bosRaw.write("success".getBytes("UTF-8"))
+bosRaw.close()
+-----------------------------------------------------------------------------------------------------------------

@@ -1,0 +1,464 @@
+import org.apache.spark.sql.expressions.Window
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import org.apache.spark.sql.types._
+
+
+
+var snapshots_table_can = "bb_crawler_snapshots_can"
+
+val basePath = "s3://blackbook-retail-listings/bb-crawler/output/"
+
+val inputFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
+val procDate = LocalDate.parse(filedateStr, inputFormatter)
+
+val dateFormatter = DateTimeFormatter.ofPattern("yyyyMMdd")
+
+spark.sparkContext.setCheckpointDir("s3://blackbook-retail-listings/checkpoint/")
+------------------------------------------------------------------------------------
+
+import org.apache.spark.sql.expressions.Window
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import org.apache.spark.sql.types._
+snapshots_table_can: String = bb_crawler_snapshots_can
+basePath: String = s3://blackbook-retail-listings/bb-crawler/output/
+inputFormatter: java.time.format.DateTimeFormatter = Value(YearOfEra,4,19,EXCEEDS_PAD)'-'Value(MonthOfYear,2)'-'Value(DayOfMonth,2)
+procDate: java.time.LocalDate = 2025-02-26
+dateFormatter: java.time.format.DateTimeFormatter = Value(YearOfEra,4,19,EXCEEDS_PAD)Value(MonthOfYear,2)Value(DayOfMonth,2)
+
+------------------------------------------------------------------------------------------
+
+val flags_schema = new StructType()
+  .add("pos",IntegerType,true)
+  .add("category",StringType,true)
+  .add("code",StringType,true)
+  .add("name",StringType,true)
+  .add("description",StringType,true)
+  .add("data",StringType,true)
+  
+val col_cat_schema = new StructType()
+  .add("color_type",StringType,true)
+  .add("color_keyword",StringType,true)
+  .add("color_category",StringType,true)
+
+
+val flags = spark.read.option("header","true").schema(flags_schema).csv("s3://bb-qubole/resources/flags/")
+---------------------------------------------------------------------------------------------------------
+
+val lotSizeGroups = flags.filter("category='lot size'")
+						 .select("code","data")
+						 .withColumn("minmax",split($"data","\\|"))
+						 .withColumn("min_vins",$"minmax".getItem(0).cast("int"))
+						 .withColumn("max_vins",$"minmax".getItem(1).cast("int"))
+						 .withColumnRenamed("code","lot_size_flag")
+						 .drop("data","minmax")
+
+//aggregator domains
+val aggDomains = flags.filter($"category"==="site type" && $"code"==="A")
+					  .select("data")
+					  .withColumn("array",split($"data","\\|"))
+val aggDomainsDF = sc.parallelize(aggDomains.head.getString(0).split("\\|")).toDF.withColumnRenamed("value","aggregator_domain")
+
+//rental car sales domains
+val rentalDomains = flags.filter($"category"==="site type" && $"code"==="R")
+						 .select("data")
+						 .withColumn("array",split($"data","\\|"))
+val rentalDomainsDF = sc.parallelize(rentalDomains.head.getString(0).split("\\|")).toDF.withColumnRenamed("value","rental_sales_domain")
+
+//franchise sellers
+val franchiseSellersAndMakes = spark.read.options(Map("header"->"true","sep"->"\t")).csv("s3://blackbook-retail-listings/bb-crawler/resources/dealer_to_oem")
+                                         .where("market='CAN'")
+
+val franchiseSellers = franchiseSellersAndMakes.select("seller_name")
+                                               .withColumn("franchise_flag",lit("F"))
+                                               .distinct
+                                               .cache
+                            
+val franchiseSellerMakes = franchiseSellersAndMakes.select("seller_name","bb_make_name")
+                            .withColumn("oem_flag",lit(1))
+                            .distinct
+                            .cache
+							
+--------------------------------------------------------------------------------------------------------------------
+
+import java.sql.Date
+import java.time.format.DateTimeFormatter
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.Window
+
+val dateForPath = procDate.format(dateFormatter)
+
+// Read and process today's tag data
+val tagNew = spark.read.parquet(basePath + dateForPath + "/can-new")
+                       .withColumn("stock_type", lit("NEW"))
+val tagUsed = spark.read.parquet(basePath + dateForPath + "/can-used")
+                        .withColumn("stock_type", lit("USED"))
+
+val tagData = tagNew.union(tagUsed)
+                    .na.drop(Seq("seller_id"))
+                    .na.fill(Map("price" -> 0, "mileage" -> 0, "seller_zip" -> "Z9Z9Z9"))
+                    .drop("list_key") 
+                    .withColumn("list_key", concat_ws("-", $"stock_type", $"full_vin", $"seller_id", $"seller_zip"))
+
+
+// Create the snapshot
+val snapshotCandidate = tagData.withColumn("process_date", lit(Date.valueOf(procDate)))
+                               .withColumn("list_rn", row_number.over(Window.partitionBy("list_key").orderBy($"scrape_date".desc, $"mileage".desc, $"price".desc, $"record_id")))
+                               .where("list_rn = 1")
+                               .checkpoint()
+							   
+--------------------------------------------------------------------------------------------------------------------------
+
+val crawlerCurrFile = snapshotCandidate.withColumnRenamed("price", "listing_price")
+                                       .withColumnRenamed("mileage", "listing_mileage")
+                                       .withColumnRenamed("url", "listing_vdp_url")
+                                       .withColumnRenamed("heading", "vehicle_title")
+                                       .withColumnRenamed("drive", "vehicle_drivetrain")
+                                       .withColumnRenamed("transmission", "vehicle_transmission")
+                                       .withColumnRenamed("full_vin","vin")
+                                       .withColumn("tag_cpo_flag",when($"stock_type"==="NEW","0").otherwise($"cpo_flag"))
+                                       .withColumn("bb_adjusted_retail_xclean",expr("case when coalesce(bb_daily_rxcl,0)=0 then 0 else bb_daily_rxcl+coalesce(bb_ads_value,0)+coalesce(bb_mileadj_xcl,0) end"))
+                                       .withColumn("bb_adjusted_retail_clean",expr("case when coalesce(bb_daily_rcln,0)=0 then 0 else bb_daily_rcln+coalesce(bb_ads_value,0)+coalesce(bb_mileadj_cln,0) end"))
+                                       .withColumn("bb_adjusted_retail_average",expr("case when coalesce(bb_daily_ravg,0)=0 then 0 else bb_daily_ravg+coalesce(bb_ads_value,0)+coalesce(bb_mileadj_avg,0) end"))
+                                       .withColumn("bb_adjusted_retail_rough",expr("case when coalesce(bb_daily_rrgh,0)=0 then 0 else bb_daily_rrgh+coalesce(bb_ads_value,0)+coalesce(bb_mileadj_rgh,0) end"))
+                                       .withColumn("mile_flag_1",expr("case when listing_mileage<50 then 'F' when listing_mileage>300000 then 'C' else 'O' end"))
+                                       .withColumn("price_flag",expr("case when listing_price<(bb_adjusted_retail_rough/2) then 'L' when bb_adjusted_retail_xclean>0 and listing_price>(bb_adjusted_retail_xclean*2) then 'H' else 'O' end"))
+                        
+                                       
+                          
+
+// Filter to get entries with bb_match_type 'VIN'
+val snapVinTrim = crawlerCurrFile.where($"bb_match_type" === "VIN")
+
+val snaptempDescrTrim = crawlerCurrFile.where("bb_match_type not in ('MULT','VIN')")
+//val allDescrKeys = snaptempDescrTrim.select("list_key").distinct
+val countSeries = snaptempDescrTrim.groupBy("list_key").agg(countDistinct("bb_series_name").as("trim_count"))
+val shouldBeMultKeys = countSeries.where("trim_count>1").select("list_key").distinct
+
+val shouldBeMult = snaptempDescrTrim.join(shouldBeMultKeys, Seq("list_key"))
+                                    .withColumn("bb_match_type",lit("MULT"))
+
+val snapDescrTrim = snaptempDescrTrim.join(shouldBeMultKeys, Seq("list_key"), "left_anti")
+
+
+val snapMDFTrim = snapDescrTrim.where("bb_match_type='MDF'")
+                                   .withColumn("wb_len", expr("regexp_replace(regexp_replace(bb_bodystyle_name,'LWB','200'),'SWB','100')"))
+                                   .withColumn("wb_rn",row_number.over(Window.partitionBy("list_key").orderBy($"wb_len",$"bb_vehicle_id")))
+                                   .where("wb_rn=1")
+                                   .drop("wb_len","wb_rn")
+
+                                 
+val snaptempMultTrim = crawlerCurrFile.where("bb_match_type='MULT'")
+                               .union(shouldBeMult)
+                               .withColumn("pv_diff", expr("abs(bb_adjusted_retail_average-listing_price)"))
+                               .withColumn("pv_rn",row_number.over(Window.partitionBy("list_key").orderBy($"pv_diff",$"bb_vehicle_id")))
+                               .where("pv_rn=1")
+                               .drop("pv_diff","pv_rn")
+
+
+val snaptemp = snapDescrTrim.where("bb_match_type<>'MDF'")
+                            .unionByName(snaptempMultTrim)
+                            .unionByName(snapMDFTrim)
+                            .unionByName(snapVinTrim)
+                            .distinct
+                    
+val dealerVinCount = snaptemp.groupBy("seller_id").agg(countDistinct("vin").as("vin_count"))
+
+snaptemp.createOrReplaceTempView("snaptemp")
+val mileageLimits = spark.sql("select bb_vehicle_id, (percentile(listing_mileage, 0.01)*0.8) as low_limit, (percentile(listing_mileage, 0.99)*1.2) as high_limit from snaptemp where mile_flag_1='O' group by bb_vehicle_id")
+
+val currentSnapshot = snaptemp.join(aggDomainsDF, snaptemp("dealer_domain").contains(aggDomainsDF("aggregator_domain")), "left_outer")
+                              .join(rentalDomainsDF, snaptemp("dealer_domain").contains(rentalDomainsDF("rental_sales_domain")), "left_outer")
+                              .join(mileageLimits, Seq("bb_vehicle_id"), "left_outer")
+                              .join(dealerVinCount, Seq("seller_id"), "left_outer")
+							  .join(lotSizeGroups, $"vin_count">=lotSizeGroups("min_vins") && $"vin_count"<lotSizeGroups("max_vins"), "left_outer")
+                              .join(franchiseSellers, Seq("seller_name"), "left_outer")
+                              .join(franchiseSellerMakes, Seq("seller_name","bb_make_name"), "left_outer")
+                              .withColumn("dealer_type_flag",coalesce($"franchise_flag",lit("I")))
+                              .withColumn("oem_listing_flag",coalesce($"oem_flag",lit(0)))
+							  .withColumn("site_type_flag",expr("case when aggregator_domain is not null then 'A' when rental_sales_domain is not null then 'R' else 'D' end"))
+                              .withColumn("mile_flag_2",expr("case when listing_mileage<low_limit then 'L' when listing_mileage>high_limit then 'H' else 'O' end"))
+							  .withColumn("mileage_flag",expr("case mile_flag_1 when 'O' then case mile_flag_2 when 'O' then 'O' else mile_flag_2 end else mile_flag_1 end"))
+                              .withColumn("match_type",expr("case when bb_match_type in ('VIN','MULT','MDF') then bb_match_type else 'DESCR' end"))
+							  .withColumn("flags",concat($"dealer_type_flag",$"site_type_flag",$"lot_size_flag",$"price_flag",$"mileage_flag",$"oem_listing_flag"))
+                              .withColumn("cpo_flag",when($"oem_listing_flag"===0,"0").otherwise($"tag_cpo_flag"))
+                              .checkpoint
+
+-------------------------------------------------------------------------------------------------------------------
+
+val currentSnapshot_filtered = currentSnapshot
+  .withColumn("filtered", 
+    when($"stock_type" === "USED" && $"listing_price" > 0 && $"listing_mileage" > 0, lit(true))
+    .when($"stock_type" === "NEW" && $"listing_price" > 0, lit(true))
+    .otherwise(lit(false))
+  )
+  .filter($"filtered" === true)
+  .drop("filtered")
+  
+------------------------------------------------------------------------------------------------------------------
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.types.{FloatType, IntegerType}
+
+val loc_data_raw = currentSnapshot_filtered
+  .select($"vin", $"list_key", $"seller_address", $"seller_city")
+  .withColumn("online_presence",
+    when(lower($"seller_address").contains("online") || lower($"seller_city").contains("online"), lit(true))
+    .otherwise(lit(false))
+  )
+
+val vinListKeyCounts = loc_data_raw
+  .groupBy($"vin", $"list_key")
+  .agg(count(lit(1)).as("occurrences"))
+
+val scoredData = vinListKeyCounts
+  .join(loc_data_raw.select($"vin", $"list_key", $"online_presence"), Seq("vin", "list_key"))
+  .withColumn("bb_location_score", 
+    when($"online_presence", lit(0)) // case when the listing has 'online' mention
+    .otherwise(
+      when($"occurrences" === 1, lit(5))
+      .otherwise(lit(0))
+    )
+  )
+
+val createToday = currentSnapshot_filtered
+  .join(scoredData.select($"vin", $"list_key", $"bb_location_score"), Seq("vin", "list_key"), "left_outer")
+-----------------------------------------------------------------------------------------------------------------
+
+import org.apache.spark.sql.functions._
+
+val todaySnapCAN = createToday.select(
+  $"list_key",
+  $"vin",
+  $"seller_id",
+  $"record_id".cast("long"), 
+  $"seller_name",
+  $"dealer_domain",
+  $"listing_price".cast("integer"), 
+  $"stock_number",
+  $"listing_mileage".cast("integer"),
+  $"exterior_color",
+  $"interior_color",
+  $"exterior_color_categories",
+  $"interior_color_categories",
+  $"listing_vdp_url",
+  $"dealer_notes",
+  $"standard_features",
+  $"optional_features",
+  $"vehicle_title",
+  $"vehicle_engine",
+  $"vehicle_transmission",
+  $"vehicle_drivetrain",
+  $"cpo_flag",
+  $"seller_address",
+  $"seller_city",
+  $"seller_state",
+  $"seller_zip",
+  $"seller_latitude".cast("double"), 
+  $"seller_longitude",
+  $"seller_country",
+  $"market",
+  $"seller_phones",
+  $"email",
+  $"source",
+  $"bb_vehicle_id".cast("integer"), 
+  $"bb_manufacturer_cd",
+  $"bb_market_id".cast("integer"), 
+  $"bb_engine",
+  $"bb_fuel_type",
+  $"bb_model_year",
+  $"bb_make_name",
+  $"bb_model_name",
+  $"bb_series_name",
+  $"bb_bodystyle_name",
+  $"bb_mileage_cat",
+  $"bb_new_used_equivalent".cast("integer"), 
+  $"bb_reporting_segment_code",
+  $"bb_reporting_segment_name",
+  $"bb_groupnum",
+  $"bb_msrp".cast("integer"), 
+  $"bb_equipped_retail",
+  $"bb_daily_m12",
+  $"bb_daily_m24",
+  $"bb_daily_m36",
+  $"bb_daily_m48",
+  $"bb_daily_m60",
+  $"bb_daily_m72",
+  $"bb_daily_xcl",
+  $"bb_daily_cln",
+  $"bb_daily_avg",
+  $"bb_daily_rgh",
+  $"bb_daily_rxcl",
+  $"bb_daily_rcln",
+  $"bb_daily_ravg",
+  $"bb_daily_rrgh",
+  $"bb_adjusted_retail_xclean".cast("integer"), 
+  $"bb_adjusted_retail_clean".cast("integer"), 
+  $"bb_adjusted_retail_average".cast("integer"), 
+  $"bb_adjusted_retail_rough".cast("integer"), 
+  $"bb_mileadj_rxcl".as("bb_mileadj_retail_xclean"), 
+  $"bb_mileadj_rcln".as("bb_mileadj_retail_clean"),  
+  $"bb_mileadj_ravg".as("bb_mileadj_retail_average"), 
+  $"bb_mileadj_rrgh".as("bb_mileadj_retail_rough"),  
+  $"bb_ads_value".cast("integer"),
+  $"bb_ad_names",
+  $"bb_ads_json",
+  $"scrape_date".cast("date"), 
+  $"match_type",
+  $"flags",
+  $"bb_location_score".cast("integer"), 
+  $"process_date", 
+  $"stock_type" 
+)
+
+------------------------------------------------------------------------------------------
+
+import java.sql.Date
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions._
+
+// Read volume configuration
+val volConfig = spark.read.json("s3://blackbook-retail-listings/bb-crawler/resources/crawler_volume_config.jsonl")
+                          .where("market = 'CAN'")
+val floorPct = volConfig.select("volume_floor_percent").head.getDouble(0)
+val floorAbs = volConfig.select("volume_floor_absolute").head.getLong(0)
+val maxExtraDays = volConfig.select("max_extra_days").head.getLong(0)
+
+// Initialize current snapshot and volume
+todaySnapCAN.count()
+var currSnap = todaySnapCAN
+currSnap = currSnap.na.fill(Map("list_key" -> "check"))
+currSnap = currSnap.filter($"list_key" =!= "check")
+var currKeys = currSnap.select(trim(lower($"list_key")).as("list_key")).distinct()
+var currVol = currKeys.count()
+
+// Calculate minimum volume
+val prevSnap = spark.read.table(snapshots_table_can)
+                        .where($"process_date" === Date.valueOf(procDate.minusDays(1)))
+                        .withColumn("list_key", trim(lower(concat_ws("-", $"stock_type", $"vin", $"seller_id", $"seller_zip"))))
+val prevVol = prevSnap.select("list_key").count()
+val minVol = ((floorPct * prevVol).asInstanceOf[Long]).max(floorAbs)
+
+// Lookback logic
+var numExtraDays = 0
+while (currVol < minVol && numExtraDays < maxExtraDays) {
+    numExtraDays += 1
+    val lookBackDate = Date.valueOf(procDate.minusDays(numExtraDays))
+    val prevSnap = spark.read.table(snapshots_table_can)
+                              .where($"process_date" === lookBackDate)
+                              .withColumn("list_key", trim(lower(concat_ws("-", $"stock_type", $"vin", $"seller_id", $"seller_zip"))))
+
+    // Get keys not in currSnap
+    val keepKeys = prevSnap.select("list_key").except(currKeys)
+    val keepSnap = prevSnap.join(keepKeys, Seq("list_key"))
+    currSnap = currSnap.union(keepSnap).dropDuplicates("list_key")
+    currKeys = currSnap.select("list_key")
+    currVol = currKeys.count()
+}
+
+
+val windowSpec = Window.partitionBy("list_key").orderBy($"scrape_date".desc, $"listing_mileage".desc, $"listing_price".desc, $"record_id")
+val finalSnapCAN = currSnap.withColumn("list_rn", row_number.over(windowSpec))
+                                  .where("list_rn = 1")
+                                  .checkpoint()
+------------------------------------------------------------------------------------------------------------------------------------------
+
+val finalDataFrameCAN = finalSnapCAN.select(
+  $"vin",
+  $"seller_id",
+  $"record_id",
+  $"seller_name",
+  $"dealer_domain",
+  $"listing_price",
+  $"stock_number",
+  $"listing_mileage",
+  $"exterior_color",
+  $"interior_color",
+  $"exterior_color_categories",
+  $"interior_color_categories",
+  $"listing_vdp_url",
+  $"dealer_notes",
+  $"standard_features",
+  $"optional_features",
+  $"vehicle_title",
+  $"vehicle_engine",
+  $"vehicle_transmission",
+  $"vehicle_drivetrain",
+  $"cpo_flag",
+  $"seller_address",
+  $"seller_city",
+  $"seller_state",
+  $"seller_zip",
+  $"seller_latitude",
+  $"seller_longitude",
+  $"seller_country",
+  $"market",
+  $"seller_phones",
+  $"email",
+  $"source",
+  $"bb_vehicle_id",
+  $"bb_manufacturer_cd",
+  $"bb_market_id",
+  $"bb_engine",
+  $"bb_fuel_type",
+  $"bb_model_year",
+  $"bb_make_name",
+  $"bb_model_name",
+  $"bb_series_name",
+  $"bb_bodystyle_name",
+  $"bb_mileage_cat",
+  $"bb_new_used_equivalent",
+  $"bb_reporting_segment_code",
+  $"bb_reporting_segment_name",
+  $"bb_groupnum",
+  $"bb_msrp",
+  $"bb_equipped_retail",
+  $"bb_daily_m12",
+  $"bb_daily_m24",
+  $"bb_daily_m36",
+  $"bb_daily_m48",
+  $"bb_daily_m60",
+  $"bb_daily_m72",
+  $"bb_daily_xcl",
+  $"bb_daily_cln",
+  $"bb_daily_avg",
+  $"bb_daily_rgh",
+  $"bb_daily_rxcl",
+  $"bb_daily_rcln",
+  $"bb_daily_ravg",
+  $"bb_daily_rrgh",
+  $"bb_adjusted_retail_xclean",
+  $"bb_adjusted_retail_clean",
+  $"bb_adjusted_retail_average",
+  $"bb_adjusted_retail_rough",
+  $"bb_mileadj_retail_xclean",
+  $"bb_mileadj_retail_clean",
+  $"bb_mileadj_retail_average",
+  $"bb_mileadj_retail_rough",
+  $"bb_ads_value",
+  $"bb_ad_names",
+  $"bb_ads_json",
+  $"scrape_date",
+  $"match_type",
+  $"flags",
+  $"bb_location_score",
+  $"list_key",
+  $"process_date",
+  $"stock_type"
+)
+
+--------------------------------------------------------------------------------------------------
+
+//spark.sql("set spark.sql.sources.partitionOverwriteMode=dynamic")
+spark.sql("set hive.exec.dynamic.partition=true")
+spark.sql("set hive.exec.dynamic.partition.mode=nonstrict")
+
+finalDataFrameCAN.repartition(10)
+              .write.mode("overwrite")
+              .insertInto(snapshots_table_can)
+
+spark.sql("alter table "+snapshots_table_can+" recover partitions")
+
+----------------------------------------------------------------------------------------------------
