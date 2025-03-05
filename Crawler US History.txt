@@ -1,0 +1,304 @@
+
+val filedate:String = String.valueOf(z.textbox("filedate"))
+val lDate = java.time.LocalDate.parse(filedate)
+
+
+============================
+
+//make necessary imports and set up some variables
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import org.apache.spark.sql._
+import org.apache.spark.sql.expressions._
+import java.time._
+import java.sql.Date
+import java.util.UUID
+
+//historical data classes and functions
+case class HistoryDetail (
+  var date : String,
+  var vehicleId : Int,
+  var price : Int,
+  var mileage : Int,
+  var changeCode : String
+)
+
+case class HistoryHeader(
+  var numDetailRecords : Int,
+  var calcDate : String,
+  var minDate : String,
+  var maxDate : String,
+  var historyRecords : Seq[HistoryDetail]
+)
+
+val hhSchema = 
+StructType(
+	StructField("numDetailRecords",IntegerType,false) :: 
+	StructField("calcDate",StringType,true) :: 
+	StructField("minDate",StringType,true) :: 
+	StructField("maxDate",StringType,true) :: 
+	StructField("historyRecords",ArrayType(MapType(StringType,StringType)),true) :: Nil
+)
+
+val getInitialHistoryHeader = udf((vehicleId:Int, price:Int, mileage:Int, date:String) => {
+    val hdl = List(HistoryDetail(date, vehicleId, price, mileage, "I"))
+    HistoryHeader(1,LocalDate.now.toString,date,date,hdl)
+})
+
+val getFinalHistoryHeader = udf((vehicleId:Int, price:Int, mileage:Int, date:String) => {
+    val hdl = List(HistoryDetail(date, vehicleId, price, mileage, "D"))
+    HistoryHeader(1,LocalDate.now.toString,date,date,hdl)
+})
+
+val checkAddHistory = udf((hhRow:Row, prevVehicleId:Int, prevPrice:Int, prevMileage:Int, newVehicleId:Int, newPrice:Int, newMileage:Int, date:String) => {
+    val today = LocalDate.now.toString
+    var maxDate = hhRow.getAs[String]("maxDate")
+    val hdl = new scala.collection.mutable.ListBuffer[HistoryDetail]
+    val hRecs:Seq[Map[String,String]] = hhRow.getAs[Seq[Map[String,String]]]("historyRecords")
+    if(hRecs != null && hRecs.length > 0){ 
+      for(hd <- hRecs){
+          hdl += HistoryDetail(hd("date"),hd("vehicleId").toInt,hd("price").toInt,hd("mileage").toInt,hd("changeCode")) 
+      }
+    }
+    var chgCode = ""
+    if(prevPrice != newPrice && prevMileage != newMileage) chgCode = "B"
+    else if(prevPrice != newPrice) chgCode = "P"
+    else if(prevMileage != newMileage) chgCode = "M"
+    if(chgCode != ""){
+        hdl += HistoryDetail(date, newVehicleId, newPrice, newMileage, chgCode)
+        maxDate = date
+    }
+    HistoryHeader(hdl.size, today, hhRow.getAs[String]("minDate"), maxDate, hdl.toSeq)
+})
+
+val appendHistoryRecord = udf((hhRow:Row, prevVehicleId:Int, prevPrice:Int, prevMileage:Int, newVehicleId:Int, newPrice:Int, newMileage:Int, date:String, chgCode:String) => {
+    val today = LocalDate.now.toString
+    val hdl = new scala.collection.mutable.ListBuffer[HistoryDetail]
+    val hRecs:Seq[Map[String,String]] = hhRow.getAs[Seq[Map[String,String]]]("historyRecords")
+    if(hRecs != null && hRecs.length > 0){ 
+      for(hd <- hRecs){
+          hdl += HistoryDetail(hd("date"),hd("vehicleId").toInt,hd("price").toInt,hd("mileage").toInt,hd("changeCode")) 
+      }
+    }
+
+    var pmChgCode = ""
+    if(prevPrice != newPrice && prevMileage != newMileage) pmChgCode = "B"
+    else if(prevPrice != newPrice) pmChgCode = "P"
+    else if(prevMileage != newMileage) pmChgCode = "M"
+    if(pmChgCode != ""){
+        hdl += HistoryDetail(date, newVehicleId, newPrice, newMileage, pmChgCode)
+    }
+
+    hdl += HistoryDetail(date, newVehicleId, newPrice, newMileage, chgCode)
+    HistoryHeader(hdl.size, today, hhRow.getAs[String]("minDate"), date, hdl.toSeq)
+})
+
+val getMinimalHistoryString = udf((hhRow:Row) => {
+  val hRecs:Seq[Map[String,String]] = hhRow.getAs[Seq[Map[String,String]]]("historyRecords")
+  var sbAll:StringBuilder = null
+  var thisPrice:String = "this"
+  var lastPrice:String = "last"
+  var histItem:String = ""
+  if(hRecs != null && hRecs.length > 0){ 
+    for(hd <- hRecs){
+      if(hd("changeCode").equals("M")==false){
+          thisPrice = hd("price").toString
+          histItem = hd("date") + "," + hd("price") + "," + hd("mileage")
+          if(thisPrice.equals(lastPrice) == false){
+              if(sbAll == null) sbAll = new StringBuilder()
+              else sbAll.append(":")
+              sbAll.append(histItem)
+          }
+          lastPrice = thisPrice
+      }
+    }
+  }
+  
+  sbAll.toString
+})
+
+val countPriceChanges = udf((hhRow:Row) => {
+  val hRecs:Seq[Map[String,String]] = hhRow.getAs[Seq[Map[String,String]]]("historyRecords")
+  var npc:Int = 0
+  if(hRecs != null && hRecs.length > 0){ 
+    for(hd <- hRecs){
+        if(hd("changeCode") == "P") npc += 1;
+        else if(hd("changeCode") == "B") npc += 1;
+    }
+  }
+  
+  npc
+})
+
+
+val generateUUID = udf(() => UUID.randomUUID.toString)
+
+
+
+============================
+
+import java.time.YearMonth
+import java.time.format.DateTimeFormatter
+
+//calculate dates
+val currProcessdate = Date.valueOf(lDate)
+
+
+val maxPrevlDate = lDate.minusDays(1)
+
+val maxPrevDate = Date.valueOf(maxPrevlDate)
+
+val minPrevDate = Date.valueOf(maxPrevlDate.withDayOfMonth(1))
+
+
+val history_table_us = "bb_crawler_history_us"
+var snapshot_table_us = "bb_crawler_snapshots_us"
+
+var prevProcessDateUS = spark.read.table(history_table_us).where($"stock_type"==="USED" && $"process_date">=minPrevDate && $"process_date"<=maxPrevDate).select(max("process_date")).first.getDate(0)
+
+var keepHistoryDate = Date.valueOf(currProcessdate.toLocalDate.minusDays(30))
+
+val processnamedate = DateTimeFormatter.BASIC_ISO_DATE.format(lDate)
+
+
+
+============================
+
+
+//US combined USED/NEW history process
+spark.sql("set hive.exec.dynamic.partition=true")
+spark.sql("set hive.exec.dynamic.partition.mode=nonstrict")
+
+var prevHistSnapUS = spark.read.table(history_table_us)
+                          .where($"process_date"===prevProcessDateUS && $"last_process_date">=keepHistoryDate)
+                          .select($"seller_id",
+                                  $"vin",
+                                  $"zip_code",
+                                  $"stock_type",
+                                  $"list_key".as("hist_list_key"),
+                                  $"bb_listing_id",
+                                  $"record_id".as("prev_record_id"),
+                                  $"bb_vehicle_id".as("prev_vehicle_id"),
+                                  $"price_mileage_history",
+                                  $"number_price_changes",
+                                  $"price".as("prev_price"),
+                                  $"mileage".as("prev_mileage"),
+                                  $"first_process_date",
+                                  $"last_process_date")
+
+var nextSnapUS = spark.read.table(snapshot_table_us)
+                      .where($"process_date"===currProcessdate)
+                      .select($"vin",
+                              $"seller_id",
+                              $"seller_zip".as("zip_code"),
+                              $"list_key".as("snap_list_key"),
+                              $"record_id",
+                              $"stock_type",
+                              $"process_date",
+                              $"listing_price".as("price"),
+                              $"listing_mileage".as("mileage"),
+                              $"bb_vehicle_id")
+
+var nextSnapChgUS = nextSnapUS.join(prevHistSnapUS, Seq("stock_type","vin","seller_id","zip_code"))
+                    .withColumn("price_mileage_history", to_json(checkAddHistory(from_json($"price_mileage_history", hhSchema),$"prev_vehicle_id",$"prev_price",$"prev_mileage",$"bb_vehicle_id",$"price",$"mileage", lit(currProcessdate.toString))))
+                    .withColumn("number_price_changes",countPriceChanges(from_json($"price_mileage_history", hhSchema)))
+                    .withColumn("last_process_date", $"process_date")
+                    .withColumnRenamed("snap_list_key","list_key")
+
+var nextSnapNewUS = nextSnapUS.join(prevHistSnapUS, Seq("stock_type","vin","seller_id","zip_code"), "left_anti")
+                    .withColumn("bb_listing_id", generateUUID())
+                    .withColumn("price_mileage_history", to_json(getInitialHistoryHeader($"bb_vehicle_id", $"price", $"mileage", $"process_date")))
+                    .withColumn("number_price_changes",lit(0))
+                    .withColumn("first_process_date", $"process_date")
+                    .withColumn("last_process_date", $"process_date")
+                    .withColumnRenamed("snap_list_key","list_key")
+
+val psmWindowUS = Window.partitionBy("list_key").orderBy($"last_process_date".desc,$"number_price_changes".desc)
+var prevSnapMissUS = prevHistSnapUS.join(nextSnapUS, Seq("stock_type","vin","seller_id","zip_code"), "left_anti")
+                       .withColumn("process_date", lit(currProcessdate))
+                       .withColumnRenamed("hist_list_key","list_key")
+                       .where($"last_process_date">=keepHistoryDate)
+                       .withColumn("rn",row_number.over(psmWindowUS))
+                       .where("rn=1")
+
+val hist_us = nextSnapNewUS.select("vin",
+                                   "seller_id",
+                                   "zip_code",
+                                   "record_id",
+                                   "price",
+                                   "mileage",
+                                   "bb_vehicle_id",
+                                   "bb_listing_id",
+                                   "price_mileage_history",
+                                   "number_price_changes",
+                                   "first_process_date",
+                                   "last_process_date",
+                                   "list_key",
+                                   "process_date",
+                                   "stock_type")
+        .union(nextSnapChgUS.select("vin",
+                                    "seller_id",
+                                    "zip_code",
+                                    "record_id",
+                                    "price",
+                                    "mileage",
+                                    "bb_vehicle_id",
+                                    "bb_listing_id",
+                                    "price_mileage_history",
+                                    "number_price_changes",
+                                    "first_process_date",
+                                    "last_process_date",
+                                    "list_key",
+                                    "process_date",
+                                    "stock_type"))
+        .union(prevSnapMissUS.select("vin",
+                                     "seller_id",
+                                     "zip_code",
+                                     "prev_record_id",
+                                     "prev_price",
+                                     "prev_mileage",
+                                     "prev_vehicle_id",
+                                     "bb_listing_id",
+                                     "price_mileage_history",
+                                     "number_price_changes",
+                                     "first_process_date",
+                                     "last_process_date",
+                                     "list_key",
+                                     "process_date",
+                                     "stock_type"))
+
+
+hist_us.where("list_key is not null and bb_listing_id is not null")
+       .withColumn("lk_rn",row_number.over(Window.partitionBy("list_key").orderBy($"last_process_date".desc,$"number_price_changes".desc)))
+       .withColumn("li_rn",row_number.over(Window.partitionBy("bb_listing_id").orderBy($"last_process_date".desc,$"number_price_changes".desc)))
+       .where("lk_rn=1 and li_rn=1").drop("lk_rn","li_rn")
+       .repartition(20).write.mode("overwrite").insertInto(history_table_us)
+        
+spark.sql("alter table "+history_table_us+" recover partitions")
+
+prevSnapMissUS.unpersist
+nextSnapNewUS.unpersist
+nextSnapChgUS.unpersist
+prevHistSnapUS.unpersist
+nextSnapUS.unpersist
+
+
+============================
+
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import org.apache.hadoop.fs.FileSystem
+import org.apache.hadoop.fs.Path
+import java.net.URI
+
+
+val processnamedate = DateTimeFormatter.BASIC_ISO_DATE.format(lDate)
+
+val rawDataDir = "s3://blackbook-retail-listings/bb-crawler/output/" + processnamedate + "/"
+val rawDataFS = FileSystem.get(new URI(rawDataDir), sc.hadoopConfiguration)
+val bosRaw = new java.io.BufferedOutputStream(rawDataFS.create(new Path(rawDataDir + "bbUS_history_flag")))
+bosRaw.write("success".getBytes("UTF-8"))
+bosRaw.close()
+
+
+============================

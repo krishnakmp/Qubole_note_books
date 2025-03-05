@@ -1,1 +1,1767 @@
-Crawler Vehicle Identification
+import java.sql.Date
+import java.time.LocalDate
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.DataFrame
+
+val filedateStr: String = String.valueOf(z.textbox("filedate"))
+val filedate_path = filedateStr.replace("-", "")
+val filedate = Date.valueOf(filedateStr)
+
+// Update the input base path
+val file_in = "s3://bb-retail-listings/vehicle_files/" + filedate_path + "/"
+
+
+// Update the output base path
+val output_base = "s3://blackbook-retail-listings/bb-crawler/output/" + filedate_path + "/"
+
+
+val scrape_date = filedate_path
+
+val us_used_car_file_out = output_base + "us-used"
+val us_new_car_file_out = output_base + "us-new"
+val truck_file_out = output_base + "truck"
+val ps_file_out = output_base + "ps"
+val cpi_file_out = output_base + "old-cpi"
+val vnf_file_out = output_base + "vnf"
+val counts_file_out = output_base + "counts"
+val can_used_car_file_out = output_base+"can-used"
+val can_new_car_file_out = output_base+"can-new"
+
+=========================================
+
+
+import info.debatty.java.stringsimilarity._;
+import com.blackbook.util.DescriptionUtils2
+import com.blackbook.model.BlackBookWData
+import org.apache.spark.sql.types._
+
+val nl = new NormalizedLevenshtein;
+val ro = new RatcliffObershelp;
+val descrUtils = new DescriptionUtils2
+
+val getCombinedSimilarityScore = udf((extDescrIn:String, bbRefYear:String, bbRefMake:String, bbRefModel:String, bbRefStyle:String, bbSeriesIn:String, bbStyleIn:String) => {
+    var modelData = new BlackBookWData
+    if(bbRefYear!="") modelData.model_year = bbRefYear
+    if(bbRefMake!="") modelData.make = bbRefMake
+    if(bbRefModel!="") modelData.model = bbRefModel
+    if(bbRefStyle!="") modelData.style = bbRefStyle
+    
+    descrUtils.parseDescription(extDescrIn, modelData)
+    val extDescr = descrUtils.getParsedTrim.replace("LAIE", "LARAMIE")
+    
+    var series = ""
+    val ext = ' '+extDescr+' '
+    if(bbSeriesIn == null){
+        series = "BASE"
+    }
+    else{
+        series = bbSeriesIn.toUpperCase
+    }
+    
+    val bbDescr = series + " " + bbStyleIn.toUpperCase
+
+    val nls = (1 - nl.distance(extDescr, bbDescr))
+    val ros = ro.similarity(extDescr, bbDescr)
+    var score = nls+ros
+    
+    if((' '+extDescr+' ').indexOf(' '+series+' ')>=0){
+        score = score * 1.5
+    }
+    
+    score
+})
+
+
+val getMaxMileageAdj = udf((vehKm:Int, yearDiff:Int, maxKm:Int, kmFactor:Float) => {
+    var kmDiff = vehKm-maxKm
+    var maxAdj:Float = 0
+    if(yearDiff <= 13 && kmDiff > 0){
+        maxAdj = kmDiff * kmFactor * -1
+    }
+    
+    maxAdj.toInt
+})
+
+val flags_schema = new StructType()
+  .add("pos",IntegerType,true)
+  .add("category",StringType,true)
+  .add("code",StringType,true)
+  .add("name",StringType,true)
+  .add("description",StringType,true)
+  .add("data",StringType,true)
+  
+val col_cat_schema = new StructType()
+  .add("color_type",StringType,true)
+  .add("color_keyword",StringType,true)
+  .add("color_category",StringType,true)
+
+
+val flags = spark.read.option("header","true").schema(flags_schema).csv("s3://bb-qubole/resources/flags/")
+
+val color_categories = spark.read.option("header","true").schema(col_cat_schema).csv("s3://bb-qubole/resources/color_categories/")
+
+val ext_color_categories = color_categories.select("color_keyword","color_category").where($"color_type" === "ext")
+val int_color_categories = color_categories.select("color_keyword","color_category").where($"color_type" === "int")
+
+spark.sparkContext.setCheckpointDir("s3://blackbook-retail-listings/bb-crawler/checkpoint/")
+
+
+========================================================
+
+//udf to clean  special characters
+//val udfCleaner = udf((str: String) => if (str != null) str.replaceAll("[\t\r\n]", " ") else null)
+val udfCleaner = udf((str: String) => if (str != null) str.replaceAll("[\t\r\n]", " ").trim else null)
+
+val cleanPostalCode = udf((postalCodeIn:String, market:String) => {
+    var postalCodeOut = if(postalCodeIn==null) "" else postalCodeIn.replaceAll(" ", "")
+    
+    if(market=="US" && postalCodeOut.length>4) postalCodeOut = postalCodeOut.substring(0,5)
+    else if(market=="CA" && postalCodeOut.length>5) postalCodeOut = postalCodeOut.substring(0,6)
+
+    postalCodeOut
+})
+
+def cleanColumns(df: DataFrame): DataFrame = {
+  df.schema.fields.foldLeft(df) {
+    case (currentDF, field) if field.dataType == StringType =>
+      currentDF.withColumn(field.name, udfCleaner(col(field.name)))
+    case (currentDF, _) => currentDF
+  }
+}
+
+var retail_data_raw = spark.read.json(file_in)
+                           .withColumnRenamed("postal_code","postal_code_raw")
+                           .withColumn("postal_code",cleanPostalCode($"postal_code_raw",$"market"))
+                           
+
+                           
+
+val cleanVinUdf = udf((str: String) => {
+  if (str != null) {
+    val cleaned = str.replaceAll("[^A-Za-z0-9]", "") // Remove non-alphanumeric characters
+    if (cleaned.length > 17) cleaned.substring(0, 17) else cleaned // Trim to length 17
+  } else null
+})
+
+// Apply the cleanVinUDF 
+retail_data_raw = retail_data_raw.withColumn("vin", cleanVinUdf(col("vin")))
+
+
+
+
+//Apply cleaning
+retail_data_raw = cleanColumns(retail_data_raw)
+
+
+
+
+val dfColumns = retail_data_raw.columns
+
+
+if(dfColumns.contains("lat") == false){
+    retail_data_raw = retail_data_raw.withColumn("lat", lit(null).cast(StringType))
+}
+if(dfColumns.contains("lon") == false){
+    retail_data_raw = retail_data_raw.withColumn("lon", lit(null).cast(StringType))
+}
+         
+val can_zip2latlong = spark.read.options(Map("header"->"true"))
+                                .csv("s3://blackbook-retail-listings/resources/zip2latlong/Bridge_ZipCodes_Canada.csv")
+                                .where("Latitude<>'' and Latitude is not null and Longitude<>'' and Longitude is not null")
+                                .select(regexp_replace($"PostCode", " ", "").as("postal_code"),$"Latitude".as("zip_latitude"),$"Longitude".as("zip_longitude"))
+
+
+val us_zip2latlong = spark.read.options(Map("header"->"true"))
+                               .csv("s3://blackbook-retail-listings/resources/zip2latlong/Bridge_ZipCodes_US.csv")
+                                .where("Latitude<>'' and Latitude is not null and Longitude<>'' and Longitude is not null")
+                               .select(regexp_replace($"ZIP_CDE", " ", "").as("postal_code"),$"Latitude".as("zip_latitude"),$"Longitude".as("zip_longitude"))
+
+val zip2latlong = can_zip2latlong.union(us_zip2latlong)
+
+// Defines regex pattern to extract the domain from a URL
+val urlPattern = "https?://(?:www\\.)?([a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})(/|$)"
+
+
+var retail_data = retail_data_raw.join(zip2latlong, Seq("postal_code"), "left_outer")
+                                .withColumn("seller_latitude", expr("case when lat is null or lat='' or lon is null or lon='' then zip_latitude else lat end"))
+                                .withColumn("seller_longitude", expr("case when lat is null or lat='' or lon is null or lon='' then zip_longitude else lon end"))
+                                .withColumn("raw_location_score", lit(null).cast(DoubleType)) //Adding raw location score Initialize with nulls until added to raw files
+                                .withColumn("norm_location_score", lit(null).cast(StringType)) // Adding normalized location score                                 
+                                .select(
+                                $"vendor_id",
+                                         $"vin".as("full_vin"),
+                                         $"price".cast("int"),
+                                         $"stock_number",
+                                         $"stock_type",
+                                         $"mileage".cast("int"),
+                                         $"exterior_color",
+                                         $"interior_color",
+                                         $"url",
+                                         $"dealer_notes",
+                                         $"standard_features",
+                                         $"optional_features",
+                                         $"heading",
+                                         $"engine".as("vehicle_engine"),
+                                         $"transmission",
+                                         $"drive",
+                                         $"certified",
+                                         $"name",
+                                         $"address",
+                                         $"city",
+                                         $"state_province",
+                                         $"postal_code",
+                                         $"country",
+                                         $"market",
+                                         $"phone",
+                                         $"email", 
+                                         $"seller_latitude".cast("double"),
+                                         $"seller_longitude".cast("double"),
+                                         $"raw_location_score",
+                                        $"norm_location_score")
+                               
+                                 .withColumn("record_id", monotonically_increasing_id())
+                                 .withColumn("vin8",substring($"full_vin", 1, 8))
+                                 .withColumn("vin_year",substring($"full_vin", 10, 1))
+                                 // Extract dealer domain from the URL
+                                 .withColumn("dealer_domain", regexp_extract($"url", urlPattern, 1))
+                                 .withColumn("cpo_flag", expr("case when certified = true or stock_type='Certified' or lower(heading) like '%certified%' or lower(heading) like '%cpo%' or lower(url) like '%certified%' or lower(url) like '%cpo%' then '1' else '0' end"))
+                                //  .withColumn("listing_vdp_website",substring_index($"url","/",3))
+                                //  .withColumn("listing_vdp_domain",expr("case when listing_vdp_website like 'https%' then substring(listing_vdp_website,13,99) when listing_vdp_website like 'http:%' then substring(listing_vdp_website,12,99) else listing_vdp_website end"))
+                                 .withColumn("scrape_date", lit(scrape_date)) // Adds the scrape_date 
+                                 .withColumn("process_date",lit(filedate))
+                                 .withColumn("source",lit("bb-crawler"))
+                                 .withColumn("sn4id",coalesce(lower(regexp_replace(regexp_replace($"name"," ","-"),"'","")),lower(regexp_replace($"dealer_domain","\\.","_"))))
+                                 .withColumn("sc4id",coalesce(lower(regexp_replace(regexp_replace($"city"," ","-"),"'","")),lit("no-city")))
+                                 .withColumn("ss4id",coalesce(lower(regexp_replace($"state_province"," ","-")),lit("XX")))
+                                 .withColumn("seller_id", concat_ws("_",$"sn4id",$"sc4id",$"ss4id"))
+                                 .withColumn("postal_code", expr("case when market = 'US' and (postal_code is null or postal_code = '') then '99999' when market = 'CA' and (postal_code is null or postal_code = '') then 'Z9Z9Z9' else postal_code end"))
+                                 .drop("sn4id","sc4id","ss4id")
+
+   
+  
+  // Use VIN and the extracted dealer domain for the list key
+  .withColumn("list_key", concat_ws("-", $"stock_type", $"full_vin", $"seller_id", $"postal_code"))
+  .cache()
+
+val windowSpec = Window.partitionBy("list_key").orderBy($"price".desc, $"mileage".desc)
+
+
+retail_data = retail_data.withColumn("row_num", row_number().over(windowSpec))
+
+val ext_color_matches = retail_data.where("exterior_color<>''")
+                                   .select(lower($"exterior_color").as("ext_color")).distinct
+                                   .join(ext_color_categories, $"ext_color".contains($"color_keyword"))
+                                   .groupBy($"ext_color").agg(concat_ws(",",collect_set($"color_category")).as("exterior_color_categories"))
+                                   .distinct.cache
+                            
+val int_color_matches = retail_data.where("interior_color<>''")
+                                   .select(lower($"interior_color").as("int_color")).distinct
+                                   .join(int_color_categories, $"int_color".contains($"color_keyword"))
+                                   .groupBy($"int_color").agg(concat_ws(",",collect_set($"color_category")).as("interior_color_categories"))
+                                   .distinct.cache
+                                
+val cpi_path = "s3://bb-qubole/resources/cpi_make_model.csv"
+val cpi_mm = spark.read.option("header",true).csv(cpi_path)
+
+val cpi_makes = cpi_mm.where("model=''").select("make")
+val cpi_models = cpi_mm.where("model<>''")
+
+val cpi_list_make = retail_data.join(cpi_makes, retail_data("heading").contains(cpi_makes("make")), "left_semi")
+val cpi_list_model = retail_data.join(cpi_models, retail_data("heading").contains(cpi_models("make")) && retail_data("heading").contains(cpi_models("model")), "left_semi")
+
+val cpi_data = cpi_list_make.union(cpi_list_model)
+
+
+=================================
+
+cpi_data.select($"record_id",
+                $"vendor_id",
+                $"seller_id",
+                $"list_key",
+                $"full_vin",
+                $"price".cast("int"),
+                $"stock_number",
+                $"stock_type",
+                $"mileage".cast("int"),
+                $"exterior_color",
+                $"interior_color",
+                $"url",
+                $"dealer_notes",
+                $"standard_features",
+                $"optional_features",
+                $"heading",
+                $"vehicle_engine",
+                $"transmission",
+                $"drive",
+               // $"certified",
+                $"name",
+                $"address",
+                $"city",
+                $"state_province",
+                $"postal_code",
+                $"country",
+                $"market",
+                $"phone",
+                //$"cpo_flag",
+                $"seller_latitude",
+                $"seller_longitude",
+                $"scrape_date",
+                $"raw_location_score",
+                $"norm_location_score",
+                $"row_num",
+                $"dealer_domain")
+                
+                
+                
+                
+      .coalesce(1).write.mode("overwrite").parquet(cpi_file_out)
+     // .coalesce(1).write.mode("overwrite").csv("s3://blackbook-retail-listings/bb-crawler/output/test")
+    //.write.mode("overwrite").parquet(cpi_file_out)
+
+cpi_data.unpersist
+
+
+======================================
+
+// data for all markets
+
+// Refreshing tables
+spark.sql("REFRESH TABLE editorial.vin_data")
+spark.sql("REFRESH TABLE editorial.vehicle_data")  
+spark.sql("REFRESH TABLE editorial.vehicle_add_deducts")
+
+val vin_data = spark.read.table("editorial.vin_data")
+                         .withColumnRenamed("vin","vin8")
+                         
+
+val veh_data = spark.read.table("editorial.vehicle_data")
+                         .select($"vehicle_id",
+                                 $"model_year".cast("int").as("my_num"),
+                                 lit(LocalDate.now.getYear).as("current_year"),
+                                 $"model_year",
+                                 $"make_name",
+                                 $"model_name",
+                                 $"series_name",
+                                 $"bodystyle_name",
+                                 $"mileage_cat",
+                                 $"new_used_equivalent",
+                                 $"reporting_segment_code",
+                                 $"reporting_segment_name",
+                                 $"groupnum",
+                                 $"manufacturer_cd",
+                                 $"msrp".as("bb_msrp"),
+                                 $"equipped_retail",
+                                 $"daily_m12",
+                                 $"daily_m24",
+                                 $"daily_m36",
+                                 $"daily_m48",
+                                 $"daily_m60",
+                                 $"daily_m72",
+                                 $"daily_xcl",
+                                 $"daily_cln",
+                                 (coalesce($"daily_avg",lit(0))+coalesce($"daily_avg_calc",lit(0))).as("daily_avg"),
+                                 (coalesce($"daily_rgh",lit(0))+coalesce($"daily_rgh_calc",lit(0))).as("daily_rgh"),
+                                 $"daily_rxcl",
+                                 $"daily_rcln",
+                                 (coalesce($"daily_ravg",lit(0))+coalesce($"daily_ravg_calc",lit(0))).as("daily_ravg"),
+                                 (coalesce($"daily_rrgh",lit(0))+coalesce($"daily_rrgh_calc",lit(0))).as("daily_rrgh"))
+                         .withColumn("yeardiff", expr("current_year - my_num"))
+                         .drop("my_num","current_year")
+
+val veh_vin_data = vin_data.join(veh_data,"vehicle_id")
+
+val veh_ad_data = spark.read.table("editorial.vehicle_add_deducts")
+                            .withColumnRenamed("vin","vin8")
+
+
+val retail_bb_data = retail_data.join(veh_vin_data,Seq("vin8","vin_year"),"left_outer")
+
+val vnf = retail_bb_data.where("vehicle_id is null")
+
+val match_count = retail_bb_data.where("vehicle_id is not null")
+                                .groupBy("record_id","market_id")
+                                .agg(countDistinct("vehicle_id").as("num_match"),countDistinct("model_name").as("num_model"),countDistinct("bodystyle_name").as("num_style"))
+                                .withColumn("match_type",when($"num_match"===1,"VIN").otherwise("MULT"))
+
+val truck_data = retail_bb_data.where("market_id=7")
+                               .join(match_count.where("market_id=7").select("record_id","match_type"), "record_id")
+                               .join(ext_color_matches, lower(retail_bb_data("exterior_color"))===ext_color_matches("ext_color"), "left_outer")
+                               .join(int_color_matches, lower(retail_bb_data("interior_color"))===int_color_matches("int_color"), "left_outer")
+
+val ps_data = retail_bb_data.where("market_id=4")
+                            .join(match_count.where("market_id=4").select("record_id","match_type"), "record_id")
+                            .join(ext_color_matches, lower(retail_bb_data("exterior_color"))===ext_color_matches("ext_color"), "left_outer")
+                            .join(int_color_matches, lower(retail_bb_data("interior_color"))===int_color_matches("int_color"), "left_outer")
+                            
+=======================
+
+ps_data.select($"record_id",
+                $"vendor_id",
+                $"seller_id",
+                $"list_key",
+                $"full_vin",
+                $"price".cast("int"),
+                $"stock_number",
+                $"stock_type",
+                $"mileage".cast("int"),
+                $"exterior_color",
+                $"interior_color",
+                $"url",
+                $"dealer_notes",
+                $"standard_features",
+                $"optional_features",
+                $"heading",
+                $"vehicle_engine",
+                $"transmission",
+                $"drive",
+                $"name",
+                $"address",
+                $"city",
+                $"state_province",
+                $"postal_code",
+                $"country",
+                $"market",
+                $"phone",
+                // $"cpo_flag",
+                $"seller_latitude",
+                $"seller_longitude",
+               $"vehicle_id".as("bb_vehicle_id"),
+               $"market_id".as("bb_market_id"),
+               $"engine".as("bb_engine"),
+               $"fuel_type".as("bb_fuel_type"),
+               $"model_year".as("bb_model_year"),
+               $"make_name".as("bb_make_name"),
+               $"model_name".as("bb_model_name"),
+               $"manufacturer_cd".as("bb_manufacturer_cd"),
+               $"bb_msrp",
+               $"daily_avg".as("bb_daily_avg"),
+               $"daily_ravg".as("bb_daily_ravg"),
+               $"match_type",
+               $"exterior_color_categories",
+               $"interior_color_categories",
+                $"scrape_date", 
+               $"raw_location_score",
+                   $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+                
+               
+       .coalesce(1).write.mode("overwrite").parquet(ps_file_out)
+       //.write.mode("overwrite").parquet(ps_file_out)
+ps_data.unpersist
+
+==============================
+
+
+truck_data.select($"record_id",
+                $"vendor_id",
+                $"seller_id",
+                $"list_key",
+                $"full_vin",
+                $"price".cast("int"),
+                $"stock_number",
+                $"stock_type",
+                $"mileage".cast("int"),
+                $"exterior_color",
+                $"interior_color",
+                $"url",
+                $"dealer_notes",
+                $"standard_features",
+                $"optional_features",
+                $"heading",
+                $"vehicle_engine",
+                $"transmission",
+                $"drive",
+                $"name",
+                $"address",
+                $"city",
+                $"state_province",
+                $"postal_code",
+                $"country",
+                $"market",
+                $"phone",
+                //$"cpo_flag",
+                $"seller_latitude",
+                $"seller_longitude",
+                $"vehicle_id".as("bb_vehicle_id"),
+                $"market_id".as("bb_market_id"),
+                $"engine".as("bb_engine"),
+                $"fuel_type".as("bb_fuel_type"),
+                $"model_year".as("bb_model_year"),
+                $"make_name".as("bb_make_name"),
+                $"model_name".as("bb_model_name"),
+                $"bodystyle_name".as("bb_bodystyle_name"),
+                $"manufacturer_cd".as("bb_manufacturer_cd"),
+                $"bb_msrp",
+                $"equipped_retail".as("bb_equipped_retail"),
+                $"daily_avg".as("bb_daily_avg"),
+                $"daily_rgh".as("bb_daily_rgh"),
+                $"daily_ravg".as("bb_daily_ravg"),
+                $"daily_rrgh".as("bb_daily_rrgh"),
+                $"match_type",
+                $"exterior_color_categories",
+                $"interior_color_categories",
+                $"scrape_date",
+                $"raw_location_score",
+                  $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+                
+          .coalesce(1).write.mode("overwrite").parquet(truck_file_out)
+//.write.mode("overwrite").parquet(truck_file_out)
+          
+truck_data.unpersist
+
+
+==============================
+
+vnf.select($"record_id",
+          $"vendor_id",
+          $"seller_id",
+          $"list_key",
+          $"full_vin",
+          $"stock_type",
+          $"price",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+          $"mileage",
+          $"exterior_color",
+          $"interior_color",
+          $"url",
+          $"dealer_notes",
+          $"standard_features",
+          $"optional_features",
+          $"heading",
+          $"vehicle_engine",
+          $"transmission",
+          $"drive",
+          $"email",
+          $"cpo_flag",
+          $"name".as("seller_name"),
+          $"address".as("seller_address"),
+          $"city".as("seller_city"),
+          $"state_province".as("seller_state"),
+          $"postal_code".as("seller_zip"),
+          $"seller_latitude",
+          $"seller_longitude",
+          $"country".as("seller_country"),
+          $"market",
+          //$"va_seller_websites".as("seller_websites"),
+          //$"va_seller_domains".as("seller_domains"),
+          $"phone".as("seller_phones"),
+          $"process_date",
+          $"scrape_date", 
+          $"source",
+          $"raw_location_score",
+           $"norm_location_score",
+            $"row_num",
+                $"dealer_domain")
+                
+                
+                
+          
+  .coalesce(1).write.mode("overwrite").parquet(vnf_file_out)
+  //.write.mode("overwrite").parquet(vnf_file_out)
+  
+vnf.unpersist
+
+==============================
+
+
+//US Car-LT
+
+spark.sql("REFRESH TABLE editorial.bbmilage")
+spark.sql("REFRESH TABLE editorial.us_usedcar_vinmapping")
+spark.sql("REFRESH TABLE editorial.us_usedcar_adddeductmapping")
+
+
+val veh_mileage_data = spark.read.table("editorial.bbmilage")
+                            .select($"range_begin",
+                                    $"range_end",
+                                    $"x_clean".as("max_xclean_ma"),
+                                    $"clean".as("max_clean_ma"),
+                                    $"average".as("max_average_ma"),
+                                    $"rough".as("max_rough_ma"),
+                                    $"mileage_cat",
+                                    $"full_year".as("model_year"))
+
+val evm_trim_data_us = spark.read.table("editorial.us_usedcar_vinmapping")
+                            .where("mapping_source like 'OEM%' or mapping_source like 'OTS%'")
+                            .select($"vin_number".as("full_vin"),$"vehicle_id")
+                            .distinct
+
+val evm_ad_data_us = spark.read.table("editorial.us_usedcar_adddeductmapping")
+                          .where("mapping_source like 'OEM%' or mapping_source like 'OTS%'")
+                          .select($"vin_number".as("full_vin"),$"ad_code")
+                          .distinct
+                          
+val car_data_us = retail_bb_data.where("market='US' and market_id=5")
+
+                                .join(veh_mileage_data, veh_vin_data("mileage_cat")===veh_mileage_data("mileage_cat") && 
+                                                        veh_vin_data("model_year")===veh_mileage_data("model_year") &&
+                                                        retail_bb_data("mileage").between(veh_mileage_data("range_begin"),veh_mileage_data("range_end")), "left_outer")
+                                .join(ext_color_matches, lower(retail_bb_data("exterior_color"))===ext_color_matches("ext_color"), "left_outer")
+                                .join(int_color_matches, lower(retail_bb_data("interior_color"))===int_color_matches("int_color"), "left_outer")
+                                .drop(veh_mileage_data("mileage_cat"))
+                                .drop(veh_mileage_data("model_year"))
+
+val auto_ads_us = car_data_us.join(veh_ad_data,Seq("vehicle_id","vin8","vin_year"))
+                             .withColumn("ad_map",map(lit("descr"),$"ad_description",lit("code"),$"ad_code",lit("amount"),$"current_ad_value".cast("int"),lit("src"),lit("VIN")))
+                             .select("record_id","vehicle_id","full_vin","ad_description","ad_map","current_ad_value")
+
+val evm_ads_us = car_data_us.join(evm_ad_data_us,"full_vin")
+                            .join(veh_ad_data.where("vin8 is null").select("vehicle_id","ad_description","ad_code","current_ad_value"),Seq("vehicle_id","ad_code"))
+                            .withColumn("ad_map",map(lit("descr"),$"ad_description",lit("code"),$"ad_code",lit("amount"),$"current_ad_value".cast("int"),lit("src"),lit("EVM")))
+                            .select("record_id","vehicle_id","full_vin","ad_description","ad_map","current_ad_value")
+
+val all_ads_us = auto_ads_us.union(evm_ads_us)
+                            .groupBy("record_id","vehicle_id")
+                            .agg(sum("current_ad_value").as("ads_value"),concat_ws(",",collect_list($"ad_description")).as("ad_names"),to_json(collect_list($"ad_map")).as("ads_json"))
+                            .cache
+
+val evm_us = car_data_us.join(evm_trim_data_us, Seq("full_vin","vehicle_id"))
+                        .withColumn("match_type",lit("EVM"))
+                        .distinct
+
+val vin_us = car_data_us.join(evm_us, Seq("full_vin"), "left_anti")
+                        .join(match_count.where("market_id=5 and num_match=1"), Seq("record_id"), "left_semi")
+                        .withColumn("match_type",lit("VIN"))
+                        .distinct
+
+=================================
+
+
+//Canada Car LT
+
+
+spark.sql("REFRESH TABLE editorial.can_usedcar_vinmapping")  
+spark.sql("REFRESH TABLE editorial.can_usedcar_adddeductmapping")  
+spark.sql("REFRESH TABLE editorial.bbmileageadj_can")  
+spark.sql("REFRESH TABLE editorial.bbmileagecat_can")  
+
+
+val evm_trim_data_can = spark.read.table("editorial.can_usedcar_vinmapping")
+                            .where("mapping_source like 'OEM%' or mapping_source like 'OTS%'")
+                            .select($"vin_number".as("full_vin"),$"vehicle_id")
+                            .distinct
+
+val evm_ad_data_can = spark.read.table("editorial.can_usedcar_adddeductmapping")
+                          .where("mapping_source like 'OEM%' or mapping_source like 'OTS%'")
+                          .select($"vin_number".as("full_vin"),$"ad_code")
+                          .distinct
+
+// val retail_bb_data_can = retail_data.where("market='CA'")
+//                                     .join(veh_vin_data.where("market_id=6"),Seq("vin8","vin_year"))
+
+// val match_count_can = retail_bb_data_can.groupBy("record_id","market_id")
+//                                         .agg(countDistinct("vehicle_id").as("num_match"),countDistinct("model_name").as("num_model"),countDistinct("bodystyle_name").as("num_style"),min("heading").as("veh_descr"))
+//                                         .withColumn("match_type",when($"num_match"===1,"VIN").otherwise("MULT"))
+                                        
+                                        
+
+val mile_adj = spark.read.table("editorial.bbmileageadj_can").select("yeardiff","xcleankm","cleankm","averagekm","roughkm").distinct
+val mile_cat = spark.read.table("editorial.bbmileagecat_can").select($"mileagecat".as("mileage_cat"),$"factor".as("mileage_factor")).distinct
+
+
+val car_data_can = retail_bb_data.where("market='CA' and market_id=6")
+                                 .join(mile_adj, Seq("yeardiff"), "left_outer")
+                                 .join(mile_cat, Seq("mileage_cat"), "left_outer")
+                                 .join(ext_color_matches, lower(retail_bb_data("exterior_color"))===ext_color_matches("ext_color"), "left_outer")
+                                 .join(int_color_matches, lower(retail_bb_data("interior_color"))===int_color_matches("int_color"), "left_outer")
+                                 .withColumn("max_ma_xcl", when($"yeardiff"<=13 && $"mileage".isNotNull, getMaxMileageAdj($"mileage", $"yeardiff", $"xcleankm", $"mileage_factor")).otherwise(lit(0)))
+                                 .withColumn("max_ma_cln", when($"yeardiff"<=13 && $"mileage".isNotNull, getMaxMileageAdj($"mileage", $"yeardiff", $"cleankm", $"mileage_factor")).otherwise(lit(0)))
+                                 .withColumn("max_ma_avg", when($"yeardiff"<=13 && $"mileage".isNotNull, getMaxMileageAdj($"mileage", $"yeardiff", $"averagekm", $"mileage_factor")).otherwise(lit(0)))
+                                 .withColumn("max_ma_rgh", when($"yeardiff"<=13 && $"mileage".isNotNull, getMaxMileageAdj($"mileage", $"yeardiff", $"roughkm", $"mileage_factor")).otherwise(lit(0)))
+                                 .withColumn("ma_xcl", when(abs($"max_ma_xcl")>($"daily_xcl"/2), negate($"daily_xcl"/2).cast("int")).otherwise($"max_ma_xcl"))
+                                 .withColumn("ma_cln", when(abs($"max_ma_cln")>($"daily_cln"/2), negate($"daily_cln"/2).cast("int")).otherwise($"max_ma_cln"))
+                                 .withColumn("ma_avg", when(abs($"max_ma_avg")>($"daily_avg"/2), negate($"daily_avg"/2).cast("int")).otherwise($"max_ma_avg"))
+                                 .withColumn("ma_rgh", when(abs($"max_ma_rgh")>($"daily_rgh"/2), negate($"daily_rgh"/2).cast("int")).otherwise($"max_ma_rgh"))
+                                 .withColumn("ma_rxcl", when(abs($"max_ma_xcl")>($"daily_rxcl"/2), negate($"daily_rxcl"/2).cast("int")).otherwise($"max_ma_xcl"))
+                                 .withColumn("ma_rcln", when(abs($"max_ma_cln")>($"daily_rcln"/2), negate($"daily_rcln"/2).cast("int")).otherwise($"max_ma_cln"))
+                                 .withColumn("ma_ravg", when(abs($"max_ma_avg")>($"daily_ravg"/2), negate($"daily_ravg"/2).cast("int")).otherwise($"max_ma_avg"))
+                                 .withColumn("ma_rrgh", when(abs($"max_ma_rgh")>($"daily_rrgh"/2), negate($"daily_rrgh"/2).cast("int")).otherwise($"max_ma_rgh"))
+
+
+
+val auto_ads_can = car_data_can.join(veh_ad_data,Seq("vehicle_id","vin8","vin_year"))
+                                  .withColumn("ad_map",map(lit("descr"),$"ad_description",lit("code"),$"ad_code",lit("amount"),$"current_ad_value",lit("src"),lit("VIN")))
+                                  .select("record_id","vehicle_id","full_vin","ad_description","ad_map","current_ad_value")
+
+val evm_ads_can = car_data_can.join(evm_ad_data_can,"full_vin")
+                                  .join(veh_ad_data.where("vin8 is null").select("vehicle_id","ad_description","ad_code","current_ad_value"),Seq("vehicle_id","ad_code"))
+                                  .withColumn("ad_map",map(lit("descr"),$"ad_description",lit("code"),$"ad_code",lit("amount"),$"current_ad_value",lit("src"),lit("EVM")))
+                                  .select("record_id","vehicle_id","full_vin","ad_description","ad_map","current_ad_value")
+
+val all_ads_can = auto_ads_can.union(evm_ads_can)
+                      .groupBy("record_id","vehicle_id")
+                      .agg(sum("current_ad_value").as("ads_value"),concat_ws(",",collect_list($"ad_description")).as("ad_names"),to_json(collect_list($"ad_map")).as("ads_json"))
+                      .cache
+
+val evm_can = car_data_can.join(evm_trim_data_can, Seq("full_vin","vehicle_id"))
+                          .withColumn("match_type",lit("EVM"))
+                          .distinct
+
+val vin_can = car_data_can.join(evm_can, Seq("full_vin"), "left_anti")
+                          .join(match_count.where("market_id=6 and num_match=1"), Seq("record_id"), "left_semi")
+                          .withColumn("match_type",lit("VIN"))
+                          .distinct
+
+
+=========================
+
+val vin_final_us = vin_us.join(all_ads_us, Seq("record_id","vehicle_id"), "left_outer")
+                  .select($"record_id",
+                           $"vendor_id",
+                           $"seller_id",
+                           $"list_key",
+                           $"full_vin",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+                           $"price",
+                           $"stock_number",
+                           $"mileage",
+                           $"exterior_color",
+                           $"interior_color",
+                           $"exterior_color_categories",
+                           $"interior_color_categories",
+                           $"url",
+                           $"dealer_notes",
+                           $"standard_features",
+                           $"optional_features",
+                           $"heading",
+                           $"vehicle_engine",
+                           $"transmission",
+                           $"drive",
+                           $"cpo_flag",
+                           $"name".as("seller_name"),
+                           $"address".as("seller_address"),
+                           $"city".as("seller_city"),
+                           $"state_province".as("seller_state"),
+                           $"postal_code".as("seller_zip"),
+                           $"seller_latitude",
+                           $"seller_longitude",
+                           $"country".as("seller_country"),
+                           $"market",
+                           $"phone".as("seller_phones"),
+                           $"email",
+                           $"process_date",
+                           $"source",
+                           $"market_id".as("bb_market_id"),
+                           $"engine".as("bb_engine"),
+                           $"fuel_type".as("bb_fuel_type"),
+                           $"vehicle_id".as("bb_vehicle_id"),
+                           $"model_year".as("bb_model_year"),
+                           $"make_name".as("bb_make_name"),
+                           $"model_name".as("bb_model_name"),
+                           $"series_name".as("bb_series_name"),
+                           $"bodystyle_name".as("bb_bodystyle_name"),
+                           $"mileage_cat".as("bb_mileage_cat"),
+                           $"new_used_equivalent".as("bb_new_used_equivalent"),
+                           $"reporting_segment_code".as("bb_reporting_segment_code"),
+                           $"reporting_segment_name".as("bb_reporting_segment_name"),
+                           $"groupnum".as("bb_groupnum"),
+                           $"manufacturer_cd".as("bb_manufacturer_cd"),
+                           $"bb_msrp",
+                           $"equipped_retail".as("bb_equipped_retail"),
+                           $"daily_m12".as("bb_daily_m12"),
+                           $"daily_m24".as("bb_daily_m24"),
+                           $"daily_m36".as("bb_daily_m36"),
+                           $"daily_m48".as("bb_daily_m48"),
+                           $"daily_m60".as("bb_daily_m60"),
+                           $"daily_m72".as("bb_daily_m72"),
+                           $"daily_xcl".as("bb_daily_xcl"),
+                           $"daily_cln".as("bb_daily_cln"),
+                           $"daily_avg".as("bb_daily_avg"),
+                           $"daily_rgh".as("bb_daily_rgh"),
+                           $"daily_rxcl".as("bb_daily_rxcl"),
+                           $"daily_rcln".as("bb_daily_rcln"),
+                           $"daily_ravg".as("bb_daily_ravg"),
+                           $"daily_rrgh".as("bb_daily_rrgh"),
+                           $"range_begin".as("bb_range_begin"),
+                           $"range_end".as("bb_range_end"),
+                           $"max_xclean_ma".as("bb_max_xclean_ma"),
+                           $"max_clean_ma".as("bb_max_clean_ma"),
+                           $"max_average_ma".as("bb_max_average_ma"),
+                           $"max_rough_ma".as("bb_max_rough_ma"),
+                           $"match_type".as("bb_match_type"),
+                           $"ads_value".as("bb_ads_value"),
+                           $"ad_names".as("bb_ad_names"),
+                           $"ads_json".as("bb_ads_json"),
+                            $"scrape_date", 
+                            $"raw_location_score",
+                  $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+                
+
+// vin_final_us.where("stock_type='NEW'").repartition(2).write.mode("overwrite").parquet(us_new_car_file_out)
+// vin_final_us.where("stock_type='USED'").repartition(10).write.mode("overwrite").parquet(us_used_car_file_out)
+vin_final_us.where("updated_stock_type='NEW'").write.mode("overwrite").parquet(us_new_car_file_out)
+vin_final_us.where("updated_stock_type='USED'").write.mode("overwrite").parquet(us_used_car_file_out)
+
+vin_final_us.unpersist
+vin_us.unpersist
+
+================
+
+val vin_final_can = vin_can.join(all_ads_can, Seq("record_id","vehicle_id"), "left_outer")
+                  .select($"record_id",
+                          $"vendor_id",
+                          $"seller_id",
+                          $"list_key",
+                          $"full_vin",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+                          $"price",
+                          $"stock_number",
+                          $"mileage",
+                          $"exterior_color",
+                          $"interior_color",
+                          $"exterior_color_categories",
+                          $"interior_color_categories",
+                          $"url",
+                          $"dealer_notes",
+                          $"standard_features",
+                          $"optional_features",
+                          $"heading",
+                          $"vehicle_engine",
+                          $"transmission",
+                          $"drive",
+                          $"cpo_flag",
+                          $"name".as("seller_name"),
+                          $"address".as("seller_address"),
+                          $"city".as("seller_city"),
+                          $"state_province".as("seller_state"),
+                          $"postal_code".as("seller_zip"),
+                          $"seller_latitude",
+                          $"seller_longitude",
+                          $"country".as("seller_country"),
+                          $"market",
+                          $"phone".as("seller_phones"),
+                          $"email",
+                          $"process_date",
+                          $"source",
+                          $"market_id".as("bb_market_id"),
+                                  $"engine".as("bb_engine"),
+                                  $"fuel_type".as("bb_fuel_type"),
+                                  $"vehicle_id".as("bb_vehicle_id"),
+                                  $"model_year".as("bb_model_year"),
+                                  $"make_name".as("bb_make_name"),
+                                  $"model_name".as("bb_model_name"),
+                                  $"series_name".as("bb_series_name"),
+                                  $"bodystyle_name".as("bb_bodystyle_name"),
+                                  $"mileage_cat".as("bb_mileage_cat"),
+                                  $"new_used_equivalent".as("bb_new_used_equivalent"),
+                                  $"reporting_segment_code".as("bb_reporting_segment_code"),
+                                  $"reporting_segment_name".as("bb_reporting_segment_name"),
+                                  $"groupnum".as("bb_groupnum"),
+                                  $"manufacturer_cd".as("bb_manufacturer_cd"),
+                                  $"bb_msrp",
+                                  $"equipped_retail".as("bb_equipped_retail"),
+                                  $"daily_m12".as("bb_daily_m12"),
+                                  $"daily_m24".as("bb_daily_m24"),
+                                  $"daily_m36".as("bb_daily_m36"),
+                                  $"daily_m48".as("bb_daily_m48"),
+                                  $"daily_m60".as("bb_daily_m60"),
+                                  $"daily_m72".as("bb_daily_m72"),
+                                  $"daily_xcl".as("bb_daily_xcl"),
+                                  $"daily_cln".as("bb_daily_cln"),
+                                  $"daily_avg".as("bb_daily_avg"),
+                                  $"daily_rgh".as("bb_daily_rgh"),
+                                  $"daily_rxcl".as("bb_daily_rxcl"),
+                                  $"daily_rcln".as("bb_daily_rcln"),
+                                  $"daily_ravg".as("bb_daily_ravg"),
+                                  $"daily_rrgh".as("bb_daily_rrgh"),
+                                  $"ma_xcl".as("bb_mileadj_xcl"),
+                                  $"ma_cln".as("bb_mileadj_cln"),
+                                  $"ma_avg".as("bb_mileadj_avg"),
+                                  $"ma_rgh".as("bb_mileadj_rgh"),
+                                  $"ma_rxcl".as("bb_mileadj_rxcl"),
+                                  $"ma_rcln".as("bb_mileadj_rcln"),
+                                  $"ma_ravg".as("bb_mileadj_ravg"),
+                                  $"ma_rrgh".as("bb_mileadj_rrgh"),
+                                  $"match_type".as("bb_match_type"),
+                                  $"ads_value".as("bb_ads_value"),
+                                  $"ad_names".as("bb_ad_names"),
+                                  $"ads_json".as("bb_ads_json"),
+                                  $"scrape_date", 
+                                 $"raw_location_score",
+                  $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+                
+
+// vin_final_us.where("stock_type='NEW'").repartition(2).write.mode("overwrite").parquet(us_new_car_file_out)
+// vin_final_us.where("stock_type='USED'").repartition(10).write.mode("overwrite").parquet(us_used_car_file_out)
+vin_final_can.where("updated_stock_type='NEW'").write.mode("overwrite").parquet(can_new_car_file_out)
+vin_final_can.where("updated_stock_type='USED'").write.mode("overwrite").parquet(can_used_car_file_out)
+
+vin_final_can.unpersist
+vin_can.unpersist
+
+==============================
+
+val evm_final_us = evm_us.join(all_ads_us, Seq("record_id","vehicle_id"), "left_outer")
+                   .select($"record_id",
+                           $"vendor_id",
+                           $"seller_id",
+                           $"list_key",
+                           $"full_vin",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+                           $"price",
+                           $"stock_number",
+                           $"mileage",
+                           $"exterior_color",
+                           $"interior_color",
+                           $"exterior_color_categories",
+                           $"interior_color_categories",
+                           $"url",
+                           $"dealer_notes",
+                           $"standard_features",
+                           $"optional_features",
+                           $"heading",
+                           $"vehicle_engine",
+                           $"transmission",
+                           $"drive",
+                           $"cpo_flag",
+                           $"name".as("seller_name"),
+                           $"address".as("seller_address"),
+                           $"city".as("seller_city"),
+                           $"state_province".as("seller_state"),
+                           $"postal_code".as("seller_zip"),
+                           $"seller_latitude",
+                           $"seller_longitude",
+                           $"country".as("seller_country"),
+                           $"market",
+                           $"phone".as("seller_phones"),
+                           $"email",
+                           $"process_date",
+                           $"source",
+                           $"market_id".as("bb_market_id"),
+                           $"engine".as("bb_engine"),
+                           $"fuel_type".as("bb_fuel_type"),
+                           $"vehicle_id".as("bb_vehicle_id"),
+                           $"model_year".as("bb_model_year"),
+                           $"make_name".as("bb_make_name"),
+                           $"model_name".as("bb_model_name"),
+                           $"series_name".as("bb_series_name"),
+                           $"bodystyle_name".as("bb_bodystyle_name"),
+                           $"mileage_cat".as("bb_mileage_cat"),
+                           $"new_used_equivalent".as("bb_new_used_equivalent"),
+                           $"reporting_segment_code".as("bb_reporting_segment_code"),
+                           $"reporting_segment_name".as("bb_reporting_segment_name"),
+                           $"groupnum".as("bb_groupnum"),
+                           $"manufacturer_cd".as("bb_manufacturer_cd"),
+                           $"bb_msrp",
+                           $"equipped_retail".as("bb_equipped_retail"),
+                           $"daily_m12".as("bb_daily_m12"),
+                           $"daily_m24".as("bb_daily_m24"),
+                           $"daily_m36".as("bb_daily_m36"),
+                           $"daily_m48".as("bb_daily_m48"),
+                           $"daily_m60".as("bb_daily_m60"),
+                           $"daily_m72".as("bb_daily_m72"),
+                           $"daily_xcl".as("bb_daily_xcl"),
+                           $"daily_cln".as("bb_daily_cln"),
+                           $"daily_avg".as("bb_daily_avg"),
+                           $"daily_rgh".as("bb_daily_rgh"),
+                           $"daily_rxcl".as("bb_daily_rxcl"),
+                           $"daily_rcln".as("bb_daily_rcln"),
+                           $"daily_ravg".as("bb_daily_ravg"),
+                           $"daily_rrgh".as("bb_daily_rrgh"),
+                           $"range_begin".as("bb_range_begin"),
+                           $"range_end".as("bb_range_end"),
+                           $"max_xclean_ma".as("bb_max_xclean_ma"),
+                           $"max_clean_ma".as("bb_max_clean_ma"),
+                           $"max_average_ma".as("bb_max_average_ma"),
+                           $"max_rough_ma".as("bb_max_rough_ma"),
+                           $"match_type".as("bb_match_type"),
+                           $"ads_value".as("bb_ads_value"),
+                           $"ad_names".as("bb_ad_names"),
+                           $"ads_json".as("bb_ads_json"),
+                             $"scrape_date", 
+                              $"raw_location_score",
+                   $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+                
+
+
+// evm_final_us.where("stock_type='NEW'").repartition(1).write.mode("append").parquet(us_new_car_file_out)
+// evm_final_us.where("stock_type='USED'").repartition(2).write.mode("append").parquet(us_used_car_file_out)
+evm_final_us.where("updated_stock_type='NEW'").write.mode("append").parquet(us_new_car_file_out)
+evm_final_us.where("updated_stock_type='USED'").write.mode("append").parquet(us_used_car_file_out)
+
+evm_final_us.unpersist
+evm_us.unpersist
+
+========================
+
+
+val evm_us_in_new = spark.read.parquet(us_new_car_file_out).where("bb_match_type='EVM'").select("record_id")
+val evm_us_in_used = spark.read.parquet(us_used_car_file_out).where("bb_match_type='EVM'").select("record_id")
+val evm_us_in = evm_us_in_new.union(evm_us_in_used).distinct
+
+========================
+
+val evm_final_can = evm_can.join(all_ads_can, Seq("record_id","vehicle_id"), "left_outer")
+                  .select($"record_id",
+                          $"vendor_id",
+                          $"seller_id",
+                          $"list_key",
+                          $"full_vin",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+                          $"price",
+                          $"stock_number",
+                          $"mileage",
+                          $"exterior_color",
+                          $"interior_color",
+                          $"exterior_color_categories",
+                          $"interior_color_categories",
+                          $"url",
+                          $"dealer_notes",
+                          $"standard_features",
+                          $"optional_features",
+                          $"heading",
+                          $"vehicle_engine",
+                          $"transmission",
+                          $"drive",
+                          $"cpo_flag",
+                          $"name".as("seller_name"),
+                          $"address".as("seller_address"),
+                          $"city".as("seller_city"),
+                          $"state_province".as("seller_state"),
+                          $"postal_code".as("seller_zip"),
+                          $"seller_latitude",
+                          $"seller_longitude",
+                          $"country".as("seller_country"),
+                          $"market",
+                          $"phone".as("seller_phones"),
+                          $"email",
+                          $"process_date",
+                          $"source",
+                            $"market_id".as("bb_market_id"),
+                                  $"engine".as("bb_engine"),
+                                  $"fuel_type".as("bb_fuel_type"),
+                                  $"vehicle_id".as("bb_vehicle_id"),
+                                  $"model_year".as("bb_model_year"),
+                                  $"make_name".as("bb_make_name"),
+                                  $"model_name".as("bb_model_name"),
+                                  $"series_name".as("bb_series_name"),
+                                  $"bodystyle_name".as("bb_bodystyle_name"),
+                                  $"mileage_cat".as("bb_mileage_cat"),
+                                  $"new_used_equivalent".as("bb_new_used_equivalent"),
+                                  $"reporting_segment_code".as("bb_reporting_segment_code"),
+                                  $"reporting_segment_name".as("bb_reporting_segment_name"),
+                                  $"groupnum".as("bb_groupnum"),
+                                  $"manufacturer_cd".as("bb_manufacturer_cd"),
+                                  $"bb_msrp",
+                                  $"equipped_retail".as("bb_equipped_retail"),
+                                  $"daily_m12".as("bb_daily_m12"),
+                                  $"daily_m24".as("bb_daily_m24"),
+                                  $"daily_m36".as("bb_daily_m36"),
+                                  $"daily_m48".as("bb_daily_m48"),
+                                  $"daily_m60".as("bb_daily_m60"),
+                                  $"daily_m72".as("bb_daily_m72"),
+                                  $"daily_xcl".as("bb_daily_xcl"),
+                                  $"daily_cln".as("bb_daily_cln"),
+                                  $"daily_avg".as("bb_daily_avg"),
+                                  $"daily_rgh".as("bb_daily_rgh"),
+                                  $"daily_rxcl".as("bb_daily_rxcl"),
+                                  $"daily_rcln".as("bb_daily_rcln"),
+                                  $"daily_ravg".as("bb_daily_ravg"),
+                                  $"daily_rrgh".as("bb_daily_rrgh"),
+                                  $"ma_xcl".as("bb_mileadj_xcl"),
+                                  $"ma_cln".as("bb_mileadj_cln"),
+                                  $"ma_avg".as("bb_mileadj_avg"),
+                                  $"ma_rgh".as("bb_mileadj_rgh"),
+                                  $"ma_rxcl".as("bb_mileadj_rxcl"),
+                                  $"ma_rcln".as("bb_mileadj_rcln"),
+                                  $"ma_ravg".as("bb_mileadj_ravg"),
+                                  $"ma_rrgh".as("bb_mileadj_rrgh"),
+                                  $"match_type".as("bb_match_type"),
+                                  $"ads_value".as("bb_ads_value"),
+                                  $"ad_names".as("bb_ad_names"),
+                                  $"ads_json".as("bb_ads_json"),
+                                     $"scrape_date", 
+                                    $"raw_location_score",
+                  $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+                
+
+// evm_final_us.where("stock_type='NEW'").repartition(1).write.mode("append").parquet(us_new_car_file_out)
+// evm_final_us.where("stock_type='USED'").repartition(2).write.mode("append").parquet(us_used_car_file_out)
+evm_final_can.where("updated_stock_type='NEW'").write.mode("append").parquet(can_new_car_file_out)
+evm_final_can.where("updated_stock_type='USED'").write.mode("append").parquet(can_used_car_file_out)
+
+evm_final_can.unpersist
+evm_can.unpersist
+
+===========================
+
+val evm_can_in_new = spark.read.parquet(can_new_car_file_out).where("bb_match_type='EVM'").select("record_id")
+val evm_can_in_used = spark.read.parquet(can_used_car_file_out).where("bb_match_type='EVM'").select("record_id")
+val evm_can_in = evm_us_in_new.union(evm_can_in_used).distinct
+
+==========================
+
+val mult_us = car_data_us.join(match_count.where("market_id=5 and num_match>1"), Seq("record_id"))
+                           .join(evm_us_in, Seq("record_id"), "left_anti")
+                           .drop(match_count("market_id"))
+                           .distinct
+
+val stay_mult_us = mult_us.where("upper(heading)='CLEAN' or heading is null or trim(heading)=''")
+
+val mult_us_descr = mult_us.where("upper(heading)<>'CLEAN' and heading is not null and trim(heading)<>''")
+                           .withColumn("ref_year",$"model_year")
+                           .withColumn("ref_make",$"make_name")
+                           .withColumn("ref_model", when($"num_model"===1, $"model_name").otherwise(""))
+                           .withColumn("ref_style", when($"num_style"===1, $"bodystyle_name").otherwise(""))
+                           .withColumn("raw_score",getCombinedSimilarityScore($"heading",$"ref_year",$"ref_make",$"ref_model",$"ref_style",$"series_name",$"bodystyle_name"))
+
+val max_score_us = mult_us_descr.groupBy($"record_id").agg(max($"raw_score").as("max_score"))
+                                .where("max_score>0")
+
+==============================
+
+val mult_can = car_data_can.join(match_count.where("market_id=6 and num_match>1"), Seq("record_id"))
+                          .join(evm_can_in, Seq("record_id"), "left_anti")
+                          .drop(match_count("market_id"))
+                          .distinct
+
+val stay_mult_can = mult_can.where("upper(heading)='CLEAN' or heading is null or trim(heading)=''")
+
+val mult_can_descr = mult_can.where("upper(heading)<>'CLEAN' and heading is not null and trim(heading)<>''")
+                          .withColumn("ref_year",$"model_year")
+                          .withColumn("ref_make",$"make_name")
+                          .withColumn("ref_model", when($"num_model"===1, $"model_name").otherwise(""))
+                          .withColumn("ref_style", when($"num_style"===1, $"bodystyle_name").otherwise(""))
+                          .withColumn("raw_score",getCombinedSimilarityScore($"heading",$"ref_year",$"ref_make",$"ref_model",$"ref_style",$"series_name",$"bodystyle_name"))
+
+val max_score_can = mult_can_descr.groupBy($"record_id").agg(max($"raw_score").as("max_score"))
+                                .where("max_score>0")
+
+===========================
+
+
+val still_mult_us = mult_us_descr.join(max_score_us,Seq("record_id"),"left_anti")
+
+val descr_score_us = mult_us_descr.join(max_score_us,Seq("record_id"))
+                                  .withColumn("norm_score",$"raw_score"/$"max_score")
+                                  .where("norm_score>=0.8")
+
+val match_count_ds_us = descr_score_us.groupBy("record_id")
+                                      .agg(countDistinct($"vehicle_id").cast("integer").as("num_trim"),countDistinct($"series_name").cast("integer").as("num_series"))
+                                      .withColumn("match_type",when($"num_trim"===1,"DESCR").when($"num_series"===1,"MDF").otherwise("MULT"))
+
+val descr_result_us = descr_score_us.drop("match_type")
+                                    .join(match_count_ds_us,Seq("record_id"))
+
+========================
+
+
+val still_mult_can = mult_can_descr.join(max_score_can,Seq("record_id"),"left_anti")
+
+val descr_score_can = mult_can_descr.join(max_score_can,Seq("record_id"))
+                                  .withColumn("norm_score",$"raw_score"/$"max_score")
+                                  .where("norm_score>=0.8")
+
+val match_count_ds_can = descr_score_can.groupBy("record_id")
+                                      .agg(countDistinct($"vehicle_id").cast("integer").as("num_trim"),countDistinct($"series_name").cast("integer").as("num_series"))
+                                      .withColumn("match_type",when($"num_trim"===1,"DESCR").when($"num_series"===1,"MDF").otherwise("MULT"))
+
+val descr_result_can = descr_score_can.drop("match_type")
+                                    .join(match_count_ds_can,Seq("record_id"))
+
+============================
+
+val ds_final_us = descr_result_us.join(all_ads_us, Seq("record_id","vehicle_id"), "left_outer")
+                    .select($"record_id",
+                           $"vendor_id",
+                           $"seller_id",
+                           $"list_key",
+                           $"full_vin",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+                           $"price",
+                           $"stock_number",
+                           $"mileage",
+                           $"exterior_color",
+                           $"interior_color",
+                           $"exterior_color_categories",
+                           $"interior_color_categories",
+                           $"url",
+                           $"dealer_notes",
+                           $"standard_features",
+                           $"optional_features",
+                           $"heading",
+                           $"vehicle_engine",
+                           $"transmission",
+                           $"drive",
+                           $"cpo_flag",
+                           $"name".as("seller_name"),
+                           $"address".as("seller_address"),
+                           $"city".as("seller_city"),
+                           $"state_province".as("seller_state"),
+                           $"postal_code".as("seller_zip"),
+                           $"seller_latitude",
+                           $"seller_longitude",
+                           $"country".as("seller_country"),
+                           $"market",
+                           $"phone".as("seller_phones"),
+                           $"email",
+                           $"process_date",
+                           $"source",
+                           $"market_id".as("bb_market_id"),
+                           $"engine".as("bb_engine"),
+                           $"fuel_type".as("bb_fuel_type"),
+                           $"vehicle_id".as("bb_vehicle_id"),
+                           $"model_year".as("bb_model_year"),
+                           $"make_name".as("bb_make_name"),
+                           $"model_name".as("bb_model_name"),
+                           $"series_name".as("bb_series_name"),
+                           $"bodystyle_name".as("bb_bodystyle_name"),
+                           $"mileage_cat".as("bb_mileage_cat"),
+                           $"new_used_equivalent".as("bb_new_used_equivalent"),
+                           $"reporting_segment_code".as("bb_reporting_segment_code"),
+                           $"reporting_segment_name".as("bb_reporting_segment_name"),
+                           $"groupnum".as("bb_groupnum"),
+                           $"manufacturer_cd".as("bb_manufacturer_cd"),
+                           $"bb_msrp",
+                           $"equipped_retail".as("bb_equipped_retail"),
+                           $"daily_m12".as("bb_daily_m12"),
+                           $"daily_m24".as("bb_daily_m24"),
+                           $"daily_m36".as("bb_daily_m36"),
+                           $"daily_m48".as("bb_daily_m48"),
+                           $"daily_m60".as("bb_daily_m60"),
+                           $"daily_m72".as("bb_daily_m72"),
+                           $"daily_xcl".as("bb_daily_xcl"),
+                           $"daily_cln".as("bb_daily_cln"),
+                           $"daily_avg".as("bb_daily_avg"),
+                           $"daily_rgh".as("bb_daily_rgh"),
+                           $"daily_rxcl".as("bb_daily_rxcl"),
+                           $"daily_rcln".as("bb_daily_rcln"),
+                           $"daily_ravg".as("bb_daily_ravg"),
+                           $"daily_rrgh".as("bb_daily_rrgh"),
+                           $"range_begin".as("bb_range_begin"),
+                           $"range_end".as("bb_range_end"),
+                           $"max_xclean_ma".as("bb_max_xclean_ma"),
+                           $"max_clean_ma".as("bb_max_clean_ma"),
+                           $"max_average_ma".as("bb_max_average_ma"),
+                           $"max_rough_ma".as("bb_max_rough_ma"),
+                           $"match_type".as("bb_match_type"),
+                           $"ads_value".as("bb_ads_value"),
+                           $"ad_names".as("bb_ad_names"),
+                           $"ads_json".as("bb_ads_json"),
+                           $"scrape_date",
+                            $"raw_location_score",
+                  $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+                
+   
+// ds_final_us.where("stock_type='NEW'").repartition(1).write.mode("append").parquet(us_new_car_file_out)
+// ds_final_us.where("stock_type='USED'").repartition(3).write.mode("append").parquet(us_used_car_file_out)
+ds_final_us.where("updated_stock_type='NEW'").write.mode("append").parquet(us_new_car_file_out)
+ds_final_us.where("updated_stock_type='USED'").write.mode("append").parquet(us_used_car_file_out)
+
+ds_final_us.unpersist
+descr_result_us.unpersist
+
+====================================
+
+val ds_final_can = descr_result_can.join(all_ads_can, Seq("record_id","vehicle_id"), "left_outer")
+                    .select($"record_id",
+                          $"vendor_id",
+                          $"seller_id",
+                          $"list_key",
+                          $"full_vin",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+                          $"price",
+                          $"stock_number",
+                          $"mileage",
+                          $"exterior_color",
+                          $"interior_color",
+                          $"exterior_color_categories",
+                          $"interior_color_categories",
+                          $"url",
+                          $"dealer_notes",
+                          $"standard_features",
+                          $"optional_features",
+                          $"heading",
+                          $"vehicle_engine",
+                          $"transmission",
+                          $"drive",
+                          $"cpo_flag",
+                          $"name".as("seller_name"),
+                          $"address".as("seller_address"),
+                          $"city".as("seller_city"),
+                          $"state_province".as("seller_state"),
+                          $"postal_code".as("seller_zip"),
+                          $"seller_latitude",
+                          $"seller_longitude",
+                          $"country".as("seller_country"),
+                          $"market",
+                          $"phone".as("seller_phones"),
+                          $"email",
+                          $"process_date",
+                          $"source",
+                            $"market_id".as("bb_market_id"),
+                                  $"engine".as("bb_engine"),
+                                  $"fuel_type".as("bb_fuel_type"),
+                                  $"vehicle_id".as("bb_vehicle_id"),
+                                  $"model_year".as("bb_model_year"),
+                                  $"make_name".as("bb_make_name"),
+                                  $"model_name".as("bb_model_name"),
+                                  $"series_name".as("bb_series_name"),
+                                  $"bodystyle_name".as("bb_bodystyle_name"),
+                                  $"mileage_cat".as("bb_mileage_cat"),
+                                  $"new_used_equivalent".as("bb_new_used_equivalent"),
+                                  $"reporting_segment_code".as("bb_reporting_segment_code"),
+                                  $"reporting_segment_name".as("bb_reporting_segment_name"),
+                                  $"groupnum".as("bb_groupnum"),
+                                  $"manufacturer_cd".as("bb_manufacturer_cd"),
+                                  $"bb_msrp",
+                                  $"equipped_retail".as("bb_equipped_retail"),
+                                  $"daily_m12".as("bb_daily_m12"),
+                                  $"daily_m24".as("bb_daily_m24"),
+                                  $"daily_m36".as("bb_daily_m36"),
+                                  $"daily_m48".as("bb_daily_m48"),
+                                  $"daily_m60".as("bb_daily_m60"),
+                                  $"daily_m72".as("bb_daily_m72"),
+                                  $"daily_xcl".as("bb_daily_xcl"),
+                                  $"daily_cln".as("bb_daily_cln"),
+                                  $"daily_avg".as("bb_daily_avg"),
+                                  $"daily_rgh".as("bb_daily_rgh"),
+                                  $"daily_rxcl".as("bb_daily_rxcl"),
+                                  $"daily_rcln".as("bb_daily_rcln"),
+                                  $"daily_ravg".as("bb_daily_ravg"),
+                                  $"daily_rrgh".as("bb_daily_rrgh"),
+                                  $"ma_xcl".as("bb_mileadj_xcl"),
+                                  $"ma_cln".as("bb_mileadj_cln"),
+                                  $"ma_avg".as("bb_mileadj_avg"),
+                                  $"ma_rgh".as("bb_mileadj_rgh"),
+                                  $"ma_rxcl".as("bb_mileadj_rxcl"),
+                                  $"ma_rcln".as("bb_mileadj_rcln"),
+                                  $"ma_ravg".as("bb_mileadj_ravg"),
+                                  $"ma_rrgh".as("bb_mileadj_rrgh"),
+                                  $"match_type".as("bb_match_type"),
+                                  $"ads_value".as("bb_ads_value"),
+                                  $"ad_names".as("bb_ad_names"),
+                                  $"ads_json".as("bb_ads_json"),
+                                    $"scrape_date", 
+                                    $"raw_location_score",
+                   $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+                
+
+// ds_final_us.where("stock_type='NEW'").repartition(1).write.mode("append").parquet(us_new_car_file_out)
+// ds_final_us.where("stock_type='USED'").repartition(3).write.mode("append").parquet(us_used_car_file_out)
+ds_final_can.where("updated_stock_type='NEW'").write.mode("append").parquet(can_new_car_file_out)
+ds_final_can.where("updated_stock_type='USED'").write.mode("append").parquet(can_used_car_file_out)
+
+ds_final_can.unpersist
+descr_result_can.unpersist
+
+================================
+
+
+val mult_final_us1 = stay_mult_us.join(all_ads_us, Seq("record_id","vehicle_id"), "left_outer")
+                    .select($"record_id",
+                           $"vendor_id",
+                           $"seller_id",
+                           $"list_key",
+                           $"full_vin",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+                           $"price",
+                           $"stock_number",
+                           $"mileage",
+                           $"exterior_color",
+                           $"interior_color",
+                           $"exterior_color_categories",
+                           $"interior_color_categories",
+                           $"url",
+                           $"dealer_notes",
+                           $"standard_features",
+                           $"optional_features",
+                           $"heading",
+                           $"vehicle_engine",
+                           $"transmission",
+                           $"drive",
+                           $"cpo_flag",
+                           $"name".as("seller_name"),
+                           $"address".as("seller_address"),
+                           $"city".as("seller_city"),
+                           $"state_province".as("seller_state"),
+                           $"postal_code".as("seller_zip"),
+                           $"seller_latitude",
+                           $"seller_longitude",
+                           $"country".as("seller_country"),
+                           $"market",
+                           $"phone".as("seller_phones"),
+                           $"email",
+                           $"process_date",
+                           $"source",
+                           $"market_id".as("bb_market_id"),
+                           $"engine".as("bb_engine"),
+                           $"fuel_type".as("bb_fuel_type"),
+                           $"vehicle_id".as("bb_vehicle_id"),
+                           $"model_year".as("bb_model_year"),
+                           $"make_name".as("bb_make_name"),
+                           $"model_name".as("bb_model_name"),
+                           $"series_name".as("bb_series_name"),
+                           $"bodystyle_name".as("bb_bodystyle_name"),
+                           $"mileage_cat".as("bb_mileage_cat"),
+                           $"new_used_equivalent".as("bb_new_used_equivalent"),
+                           $"reporting_segment_code".as("bb_reporting_segment_code"),
+                           $"reporting_segment_name".as("bb_reporting_segment_name"),
+                           $"groupnum".as("bb_groupnum"),
+                           $"manufacturer_cd".as("bb_manufacturer_cd"),
+                           $"bb_msrp",
+                           $"equipped_retail".as("bb_equipped_retail"),
+                           $"daily_m12".as("bb_daily_m12"),
+                           $"daily_m24".as("bb_daily_m24"),
+                           $"daily_m36".as("bb_daily_m36"),
+                           $"daily_m48".as("bb_daily_m48"),
+                           $"daily_m60".as("bb_daily_m60"),
+                           $"daily_m72".as("bb_daily_m72"),
+                           $"daily_xcl".as("bb_daily_xcl"),
+                           $"daily_cln".as("bb_daily_cln"),
+                           $"daily_avg".as("bb_daily_avg"),
+                           $"daily_rgh".as("bb_daily_rgh"),
+                           $"daily_rxcl".as("bb_daily_rxcl"),
+                           $"daily_rcln".as("bb_daily_rcln"),
+                           $"daily_ravg".as("bb_daily_ravg"),
+                           $"daily_rrgh".as("bb_daily_rrgh"),
+                           $"range_begin".as("bb_range_begin"),
+                           $"range_end".as("bb_range_end"),
+                           $"max_xclean_ma".as("bb_max_xclean_ma"),
+                           $"max_clean_ma".as("bb_max_clean_ma"),
+                           $"max_average_ma".as("bb_max_average_ma"),
+                           $"max_rough_ma".as("bb_max_rough_ma"),
+                           $"match_type".as("bb_match_type"),
+                           $"ads_value".as("bb_ads_value"),
+                           $"ad_names".as("bb_ad_names"),
+                           $"ads_json".as("bb_ads_json"),
+                               $"scrape_date", 
+                                $"raw_location_score",
+                   $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+
+// mult_final_us1.where("stock_type='NEW'").repartition(1).write.mode("append").parquet(us_new_car_file_out)
+// mult_final_us1.where("stock_type='USED'").repartition(1).write.mode("append").parquet(us_used_car_file_out)
+mult_final_us1.where("updated_stock_type='NEW'").write.mode("append").parquet(us_new_car_file_out)
+mult_final_us1.where("updated_stock_type='USED'").write.mode("append").parquet(us_used_car_file_out)
+
+mult_final_us1.unpersist
+stay_mult_us.unpersist
+
+=============================
+
+val mult_final_can1 = stay_mult_can.join(all_ads_can, Seq("record_id","vehicle_id"), "left_outer")
+                    .select($"record_id",
+                          $"vendor_id",
+                          $"seller_id",
+                          $"list_key",
+                          $"full_vin",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+                          $"price",
+                          $"stock_number",
+                          $"mileage",
+                          $"exterior_color",
+                          $"interior_color",
+                          $"exterior_color_categories",
+                          $"interior_color_categories",
+                          $"url",
+                          $"dealer_notes",
+                          $"standard_features",
+                          $"optional_features",
+                          $"heading",
+                          $"vehicle_engine",
+                          $"transmission",
+                          $"drive",
+                          $"cpo_flag",
+                          $"name".as("seller_name"),
+                          $"address".as("seller_address"),
+                          $"city".as("seller_city"),
+                          $"state_province".as("seller_state"),
+                          $"postal_code".as("seller_zip"),
+                          $"seller_latitude",
+                          $"seller_longitude",
+                          $"country".as("seller_country"),
+                          $"market",
+                          $"phone".as("seller_phones"),
+                          $"email",
+                          $"process_date",
+                          $"source",
+                            $"market_id".as("bb_market_id"),
+                                  $"engine".as("bb_engine"),
+                                  $"fuel_type".as("bb_fuel_type"),
+                                  $"vehicle_id".as("bb_vehicle_id"),
+                                  $"model_year".as("bb_model_year"),
+                                  $"make_name".as("bb_make_name"),
+                                  $"model_name".as("bb_model_name"),
+                                  $"series_name".as("bb_series_name"),
+                                  $"bodystyle_name".as("bb_bodystyle_name"),
+                                  $"mileage_cat".as("bb_mileage_cat"),
+                                  $"new_used_equivalent".as("bb_new_used_equivalent"),
+                                  $"reporting_segment_code".as("bb_reporting_segment_code"),
+                                  $"reporting_segment_name".as("bb_reporting_segment_name"),
+                                  $"groupnum".as("bb_groupnum"),
+                                  $"manufacturer_cd".as("bb_manufacturer_cd"),
+                                  $"bb_msrp",
+                                  $"equipped_retail".as("bb_equipped_retail"),
+                                  $"daily_m12".as("bb_daily_m12"),
+                                  $"daily_m24".as("bb_daily_m24"),
+                                  $"daily_m36".as("bb_daily_m36"),
+                                  $"daily_m48".as("bb_daily_m48"),
+                                  $"daily_m60".as("bb_daily_m60"),
+                                  $"daily_m72".as("bb_daily_m72"),
+                                  $"daily_xcl".as("bb_daily_xcl"),
+                                  $"daily_cln".as("bb_daily_cln"),
+                                  $"daily_avg".as("bb_daily_avg"),
+                                  $"daily_rgh".as("bb_daily_rgh"),
+                                  $"daily_rxcl".as("bb_daily_rxcl"),
+                                  $"daily_rcln".as("bb_daily_rcln"),
+                                  $"daily_ravg".as("bb_daily_ravg"),
+                                  $"daily_rrgh".as("bb_daily_rrgh"),
+                                  $"ma_xcl".as("bb_mileadj_xcl"),
+                                  $"ma_cln".as("bb_mileadj_cln"),
+                                  $"ma_avg".as("bb_mileadj_avg"),
+                                  $"ma_rgh".as("bb_mileadj_rgh"),
+                                  $"ma_rxcl".as("bb_mileadj_rxcl"),
+                                  $"ma_rcln".as("bb_mileadj_rcln"),
+                                  $"ma_ravg".as("bb_mileadj_ravg"),
+                                  $"ma_rrgh".as("bb_mileadj_rrgh"),
+                                  $"match_type".as("bb_match_type"),
+                                  $"ads_value".as("bb_ads_value"),
+                                  $"ad_names".as("bb_ad_names"),
+                                  $"ads_json".as("bb_ads_json"),
+                                    $"scrape_date", 
+                                    $"raw_location_score",
+                  $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+                
+
+// mult_final_us1.where("stock_type='NEW'").repartition(1).write.mode("append").parquet(us_new_car_file_out)
+// mult_final_us1.where("stock_type='USED'").repartition(1).write.mode("append").parquet(us_used_car_file_out)
+mult_final_can1.where("updated_stock_type='NEW'").write.mode("append").parquet(can_new_car_file_out)
+mult_final_can1.where("updated_stock_type='USED'").write.mode("append").parquet(can_used_car_file_out)
+
+mult_final_can1.unpersist
+stay_mult_can.unpersist
+
+================================
+
+
+val mult_final_us2 = still_mult_us.join(all_ads_us, Seq("record_id","vehicle_id"), "left_outer")
+                   .select($"record_id",
+                           $"vendor_id",
+                           $"seller_id",
+                           $"list_key",
+                           $"full_vin",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+                           $"price",
+                           $"stock_number",
+                           $"mileage",
+                           $"exterior_color",
+                           $"interior_color",
+                           $"exterior_color_categories",
+                           $"interior_color_categories",
+                           $"url",
+                           $"dealer_notes",
+                           $"standard_features",
+                           $"optional_features",
+                           $"heading",
+                           $"vehicle_engine",
+                           $"transmission",
+                           $"drive",
+                           $"cpo_flag",
+                           $"name".as("seller_name"),
+                           $"address".as("seller_address"),
+                           $"city".as("seller_city"),
+                           $"state_province".as("seller_state"),
+                           $"postal_code".as("seller_zip"),
+                           $"seller_latitude",
+                           $"seller_longitude",
+                           $"country".as("seller_country"),
+                           $"market",
+                           $"phone".as("seller_phones"),
+                           $"email",
+                           $"process_date",
+                           $"source",
+                           $"market_id".as("bb_market_id"),
+                           $"engine".as("bb_engine"),
+                           $"fuel_type".as("bb_fuel_type"),
+                           $"vehicle_id".as("bb_vehicle_id"),
+                           $"model_year".as("bb_model_year"),
+                           $"make_name".as("bb_make_name"),
+                           $"model_name".as("bb_model_name"),
+                           $"series_name".as("bb_series_name"),
+                           $"bodystyle_name".as("bb_bodystyle_name"),
+                           $"mileage_cat".as("bb_mileage_cat"),
+                           $"new_used_equivalent".as("bb_new_used_equivalent"),
+                           $"reporting_segment_code".as("bb_reporting_segment_code"),
+                           $"reporting_segment_name".as("bb_reporting_segment_name"),
+                           $"groupnum".as("bb_groupnum"),
+                           $"manufacturer_cd".as("bb_manufacturer_cd"),
+                           $"bb_msrp",
+                           $"equipped_retail".as("bb_equipped_retail"),
+                           $"daily_m12".as("bb_daily_m12"),
+                           $"daily_m24".as("bb_daily_m24"),
+                           $"daily_m36".as("bb_daily_m36"),
+                           $"daily_m48".as("bb_daily_m48"),
+                           $"daily_m60".as("bb_daily_m60"),
+                           $"daily_m72".as("bb_daily_m72"),
+                           $"daily_xcl".as("bb_daily_xcl"),
+                           $"daily_cln".as("bb_daily_cln"),
+                           $"daily_avg".as("bb_daily_avg"),
+                           $"daily_rgh".as("bb_daily_rgh"),
+                           $"daily_rxcl".as("bb_daily_rxcl"),
+                           $"daily_rcln".as("bb_daily_rcln"),
+                           $"daily_ravg".as("bb_daily_ravg"),
+                           $"daily_rrgh".as("bb_daily_rrgh"),
+                           $"range_begin".as("bb_range_begin"),
+                           $"range_end".as("bb_range_end"),
+                           $"max_xclean_ma".as("bb_max_xclean_ma"),
+                           $"max_clean_ma".as("bb_max_clean_ma"),
+                           $"max_average_ma".as("bb_max_average_ma"),
+                           $"max_rough_ma".as("bb_max_rough_ma"),
+                           $"match_type".as("bb_match_type"),
+                           $"ads_value".as("bb_ads_value"),
+                           $"ad_names".as("bb_ad_names"),
+                           $"ads_json".as("bb_ads_json"),
+                                 $"scrape_date", 
+                           $"raw_location_score",
+                   $"norm_location_score",
+                $"row_num",
+                $"dealer_domain")
+                
+                
+                
+
+// mult_final_us2.where("stock_type='NEW'").repartition(1).write.mode("append").parquet(us_new_car_file_out)
+// mult_final_us2.where("stock_type='USED'").repartition(1).write.mode("append").parquet(us_used_car_file_out)
+mult_final_us2.where("updated_stock_type='NEW'").write.mode("append").parquet(us_new_car_file_out)
+mult_final_us2.where("updated_stock_type='USED'").write.mode("append").parquet(us_used_car_file_out)
+
+mult_final_us2.unpersist
+still_mult_us.unpersist
+
+==================================
+
+val mult_final_can2 = still_mult_can.join(all_ads_can, Seq("record_id","vehicle_id"), "left_outer")
+                  .select($"record_id",
+                          $"vendor_id",
+                          $"seller_id",
+                          $"list_key",
+                          $"full_vin",
+          when($"stock_type"==="Certified","USED").otherwise(upper($"stock_type")).as("updated_stock_type"),
+                          $"price",
+                          $"stock_number",
+                          $"mileage",
+                          $"exterior_color",
+                          $"interior_color",
+                          $"exterior_color_categories",
+                          $"interior_color_categories",
+                          $"url",
+                          $"dealer_notes",
+                          $"standard_features",
+                          $"optional_features",
+                          $"heading",
+                          $"vehicle_engine",
+                          $"transmission",
+                          $"drive",
+                          $"cpo_flag",
+                          $"name".as("seller_name"),
+                          $"address".as("seller_address"),
+                          $"city".as("seller_city"),
+                          $"state_province".as("seller_state"),
+                          $"postal_code".as("seller_zip"),
+                          $"seller_latitude",
+                          $"seller_longitude",
+                          $"country".as("seller_country"),
+                          $"market",
+                          $"phone".as("seller_phones"),
+                          $"email",
+                          $"process_date",
+                          $"source",
+                          $"market_id".as("bb_market_id"),
+                                  $"engine".as("bb_engine"),
+                                  $"fuel_type".as("bb_fuel_type"),
+                                  $"vehicle_id".as("bb_vehicle_id"),
+                                  $"model_year".as("bb_model_year"),
+                                  $"make_name".as("bb_make_name"),
+                                  $"model_name".as("bb_model_name"),
+                                  $"series_name".as("bb_series_name"),
+                                  $"bodystyle_name".as("bb_bodystyle_name"),
+                                  $"mileage_cat".as("bb_mileage_cat"),
+                                  $"new_used_equivalent".as("bb_new_used_equivalent"),
+                                  $"reporting_segment_code".as("bb_reporting_segment_code"),
+                                  $"reporting_segment_name".as("bb_reporting_segment_name"),
+                                  $"groupnum".as("bb_groupnum"),
+                                  $"manufacturer_cd".as("bb_manufacturer_cd"),
+                                  $"bb_msrp",
+                                  $"equipped_retail".as("bb_equipped_retail"),
+                                  $"daily_m12".as("bb_daily_m12"),
+                                  $"daily_m24".as("bb_daily_m24"),
+                                  $"daily_m36".as("bb_daily_m36"),
+                                  $"daily_m48".as("bb_daily_m48"),
+                                  $"daily_m60".as("bb_daily_m60"),
+                                  $"daily_m72".as("bb_daily_m72"),
+                                  $"daily_xcl".as("bb_daily_xcl"),
+                                  $"daily_cln".as("bb_daily_cln"),
+                                  $"daily_avg".as("bb_daily_avg"),
+                                  $"daily_rgh".as("bb_daily_rgh"),
+                                  $"daily_rxcl".as("bb_daily_rxcl"),
+                                  $"daily_rcln".as("bb_daily_rcln"),
+                                  $"daily_ravg".as("bb_daily_ravg"),
+                                  $"daily_rrgh".as("bb_daily_rrgh"),
+                                  $"ma_xcl".as("bb_mileadj_xcl"),
+                                  $"ma_cln".as("bb_mileadj_cln"),
+                                  $"ma_avg".as("bb_mileadj_avg"),
+                                  $"ma_rgh".as("bb_mileadj_rgh"),
+                                  $"ma_rxcl".as("bb_mileadj_rxcl"),
+                                  $"ma_rcln".as("bb_mileadj_rcln"),
+                                  $"ma_ravg".as("bb_mileadj_ravg"),
+                                  $"ma_rrgh".as("bb_mileadj_rrgh"),
+                                  $"match_type".as("bb_match_type"),
+                                  $"ads_value".as("bb_ads_value"),
+                                  $"ad_names".as("bb_ad_names"),
+                                  $"ads_json".as("bb_ads_json"),
+                                        $"scrape_date", 
+                       $"raw_location_score",
+                  $"norm_location_score",
+                 $"row_num",
+                $"dealer_domain")
+                
+                
+
+// mult_final_us2.where("stock_type='NEW'").repartition(1).write.mode("append").parquet(us_new_car_file_out)
+// mult_final_us2.where("stock_type='USED'").repartition(1).write.mode("append").parquet(us_used_car_file_out)
+mult_final_can2.where("updated_stock_type='NEW'").write.mode("append").parquet(can_new_car_file_out)
+mult_final_can2.where("updated_stock_type='USED'").write.mode("append").parquet(can_used_car_file_out)
+
+mult_final_can2.unpersist
+still_mult_can.unpersist

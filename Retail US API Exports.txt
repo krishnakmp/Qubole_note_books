@@ -1,0 +1,190 @@
+val process_date:String = String.valueOf(z.textbox("process_date"))
+val lDate = java.time.LocalDate.parse(process_date)
+
+=================================
+
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.functions._
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.net.URI
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.sql.types.StringType
+
+val processnamedate = DateTimeFormatter.BASIC_ISO_DATE.format(lDate)
+
+val baseOutDir = "s3://blackbook-talend-editorial/one-file/us/"
+
+//val rawDataDir = "s3://blackbook-retail-listings/bb-crawler/output/"+processnamedate+"/";
+val rawDataDir = "";
+
+val activeOutDirUS = baseOutDir + "active-retail-listings-v2-" + processnamedate
+
+=================================
+
+
+val udfCleaner = udf((str: String) => if (str != null) str.replaceAll("[\t\r\n]", " ") else null)
+
+def cleanColumns(df: DataFrame): DataFrame = {
+  df.schema.fields.foldLeft(df) {
+    case (currentDF, field) if field.dataType == StringType =>
+      currentDF.withColumn(field.name, udfCleaner(col(field.name)))
+    case (currentDF, _) => currentDF
+  }
+}
+
+=================================
+
+
+val activeExportsUS = spark.table("retail_exports_us")
+.where($"process_date" === process_date && $"listing_type" === "ACTIVE"  && $"listing_id".isNotNull)
+      .select(
+        $"city",
+        $"dealer_domain",
+        $"dealer_id",
+        $"dealer_name",
+        $"dropoff_date",
+        $"ext_msrp",
+        $"exterior_color",
+        $"exterior_color_categories",
+        $"first_seen_date",
+        $"flags",
+        $"has_leather",
+        $"has_navigation",
+        $"heading",
+        $"interior_color",
+        $"interior_color_categories",
+        $"is_certified",
+        $"last_seen_date",
+        $"latitude",
+        $"listing_id",
+        $"longitude",
+        $"match_type",
+        $"mileage",
+        $"number_price_changes",
+        $"optional_features",
+        $"price",
+        $"price_mileage_history",
+        $"sale_type",
+        $"seller_comments",
+        $"seller_email",
+        $"seller_phone",
+        $"source",
+        $"standard_features",
+        $"state",
+        $"stock_type",
+        $"street",
+        $"vehicle_id",
+        $"vin",
+        $"zipcode",
+        $"listing_url",
+        $"photo_links",
+        $"location_score")
+
+
+=================================
+
+val cleanActiveExportsUS = cleanColumns(activeExportsUS)
+
+
+=================================
+
+val activeOutDirUS = baseOutDir+"active-retail-listings-v2-"+processnamedate
+
+cleanActiveExportsUS.coalesce(1).write.mode("overwrite").options(Map("header"->"true","sep"->"\t","escape"->"\"")).csv(activeOutDirUS)
+val activefsUS = FileSystem.get(new URI(activeOutDirUS + "/_SUCCESS"), sc.hadoopConfiguration)
+activefsUS.delete(new Path(activeOutDirUS + "/_SUCCESS"), true)
+
+if(baseOutDir != ""){
+    val outDataFS = FileSystem.get(new URI(baseOutDir), sc.hadoopConfiguration)
+    val bosOut = new java.io.BufferedOutputStream(outDataFS.create(new Path(baseOutDir+"us_active_listings_success")))
+    bosOut.write("success".getBytes("UTF-8"))
+    bosOut.close()
+}
+
+if(rawDataDir != ""){
+    val rawDataFS = FileSystem.get(new URI(rawDataDir), sc.hadoopConfiguration)
+    val output = rawDataFS.create(new Path(rawDataDir+"us_active_listings_success"));
+    val os = new java.io.BufferedOutputStream(output)
+    os.write("success".getBytes("UTF-8"))
+    os.close()
+}
+
+
+=================================
+
+
+val soldExportsUS = spark.table("retail_exports_us")
+.where($"process_date" === process_date && $"listing_type" === "SOLD"  && $"listing_id".isNotNull)
+      .select(
+        $"city",
+        $"dealer_domain",
+        $"dealer_id",
+        $"dealer_name",
+        $"dropoff_date",
+        $"ext_msrp",
+        $"exterior_color",
+        $"exterior_color_categories",
+        $"first_seen_date",
+        $"flags",
+        $"has_leather",
+        $"has_navigation",
+        $"heading",
+        $"interior_color",
+        $"interior_color_categories",
+        $"is_certified",
+        $"last_seen_date",
+        $"latitude",
+        $"listing_id",
+        $"longitude",
+        $"match_type",
+        $"mileage",
+        $"number_price_changes",
+        $"optional_features",
+        $"price",
+        $"price_mileage_history",
+        $"sale_type",
+        $"seller_comments",
+        $"seller_email",
+        $"seller_phone",
+        $"source",
+        $"standard_features",
+        $"state",
+        $"stock_type",
+        $"street",
+        $"vehicle_id",
+        $"vin",
+        $"zipcode",
+        $"listing_url",
+        $"photo_links",
+        $"location_score")
+
+=================================
+
+val cleanSoldExportsUS = cleanColumns(soldExportsUS)
+
+
+=================================
+
+val soldOutDirUS = baseOutDir+"sold-retail-listings-v2-"+processnamedate
+
+cleanSoldExportsUS.coalesce(1).write.mode("overwrite").options(Map("header"->"true","sep"->"\t","escape"->"\"")).csv(soldOutDirUS)
+val soldfsUS = FileSystem.get(new URI(soldOutDirUS + "/_SUCCESS"), sc.hadoopConfiguration)
+soldfsUS.delete(new Path(soldOutDirUS + "/_SUCCESS"), true)
+
+if(baseOutDir != ""){
+    val outDataFS = FileSystem.get(new URI(baseOutDir+"fs_placeholder"), sc.hadoopConfiguration)
+    val bosOut = new java.io.BufferedOutputStream(outDataFS.create(new Path(baseOutDir+"us_sold_listings_success")))
+    bosOut.write("success".getBytes("UTF-8"))
+    bosOut.close()
+}
+
+if(rawDataDir != ""){
+    val rawDataFS = FileSystem.get(new URI(rawDataDir+"bb_ready_flag"), sc.hadoopConfiguration)
+    val bosRaw = new java.io.BufferedOutputStream(rawDataFS.create(new Path(rawDataDir+"us_sold_listings_success")))
+    bosRaw.write("success".getBytes("UTF-8"))
+    bosRaw.close()
+}
+
+
+=================================
